@@ -1,0 +1,6 @@
+# 秘密情報・環境ごとの設定
+.env
+secrets/
+certs/
+
+.DS_Store

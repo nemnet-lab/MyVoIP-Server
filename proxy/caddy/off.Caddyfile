@@ -1,0 +1,15 @@
+# HTTP のみ（外部に公開しない LAN・VPN 内での利用を前提）
+{
+	auto_https off
+	admin off
+}
+
+:80 {
+	encode zstd gzip
+	# API と呼状態の WebSocket を中継する。SIP/RTP は通さない
+	reverse_proxy myvoip:8080
+	log {
+		output stdout
+		format json
+	}
+}

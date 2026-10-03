@@ -1,0 +1,15 @@
+# HTTPS（certs/ に置いた証明書を使う）
+{
+	auto_https off
+	admin off
+}
+
+:443 {
+	tls /certs/fullchain.pem /certs/privkey.pem
+	encode zstd gzip
+	reverse_proxy myvoip:8080
+	log {
+		output stdout
+		format json
+	}
+}

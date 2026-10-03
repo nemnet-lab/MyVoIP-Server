@@ -1,0 +1,11 @@
+# イメージには Go のソースだけを入れる（秘密情報を含めない）
+.git
+.github
+.env
+.env.*
+secrets
+certs
+proxy
+docs
+*.md
+docker-compose.yml

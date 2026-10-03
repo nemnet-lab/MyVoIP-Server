@@ -1,0 +1,76 @@
+# MyVoIP 着信制御サービス（MikoPBX とは別の Linux 環境で動かす）
+#
+#   cp .env.example .env   # 値を記入（COMPOSE_PROFILES で caddy / nginx を選ぶ）
+#   mkdir -p secrets && cp AuthKey_XXXXXXXXXX.p8 secrets/apns.p8
+#   docker compose up -d --build
+#
+# 詳しくは README.md を参照。
+#
+# 外部に直接公開しない LAN・VPN 内での利用を前提に、HTTP（MYVOIP_TLS=off）も選べる。
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: myvoip
+      POSTGRES_USER: myvoip
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD を .env に設定してください}
+    volumes:
+      - db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U myvoip -d myvoip"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  myvoip:
+    build: .
+    image: myvoip-server:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://myvoip:${DB_PASSWORD}@db:5432/myvoip?sslmode=disable
+      APNS_KEY_FILE: /run/secrets/apns.p8
+      TZ: Asia/Tokyo
+    volumes:
+      - ./secrets:/run/secrets:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/myvoip-server", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # リバースプロキシは .env の COMPOSE_PROFILES=caddy または nginx で選ぶ
+  caddy:
+    profiles: ["caddy"]
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./proxy/caddy/${MYVOIP_TLS:-off}.Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./certs:/certs:ro
+      - caddy_data:/data
+    depends_on:
+      - myvoip
+
+  nginx:
+    profiles: ["nginx"]
+    image: nginx:stable-alpine
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./proxy/nginx/${MYVOIP_TLS:-off}.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./certs:/certs:ro
+    depends_on:
+      - myvoip
+
+volumes:
+  db:
+  caddy_data:
