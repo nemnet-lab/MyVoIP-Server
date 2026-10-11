@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"net/http"
 	"os"
@@ -119,7 +120,8 @@ type VoIPPayload struct {
 	CallerName   string  `json:"caller_name,omitempty"`
 }
 
-// SendVoIP は VoIP Push を送る。優先度10・expiration 0（期限切れ着信を滞留させない）。
+// SendVoIP は VoIP Push を送る。優先度10。
+// expiration は呼出期限にする。端末が一時的につながらなくても、APNs が期限まで配送をやり直し、期限を過ぎた着信は滞留させない。
 func (c *Client) SendVoIP(ctx context.Context, token, environment string, p VoIPPayload) error {
 	body := map[string]any{"aps": map[string]any{}}
 	raw, _ := json.Marshal(p)
@@ -128,7 +130,11 @@ func (c *Client) SendVoIP(ctx context.Context, token, environment string, p VoIP
 	for k, v := range fields {
 		body[k] = v
 	}
-	return c.send(ctx, token, environment, c.bundleID+".voip", "voip", "10", body)
+	expiration := "0"
+	if p.ExpiresAt > 0 {
+		expiration = strconv.FormatInt(int64(math.Ceil(p.ExpiresAt)), 10)
+	}
+	return c.send(ctx, token, environment, c.bundleID+".voip", "voip", "10", expiration, body)
 }
 
 // SendAlert は不在着信の一般通知を送る（F-17）。
@@ -137,10 +143,10 @@ func (c *Client) SendAlert(ctx context.Context, token, environment, title, messa
 		"alert": map[string]string{"title": title, "body": message},
 		"sound": "default",
 	}}
-	return c.send(ctx, token, environment, c.bundleID, "alert", "10", body)
+	return c.send(ctx, token, environment, c.bundleID, "alert", "10", "0", body)
 }
 
-func (c *Client) send(ctx context.Context, token, environment, topic, pushType, priority string, body any) error {
+func (c *Client) send(ctx context.Context, token, environment, topic, pushType, priority, expiration string, body any) error {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return err
@@ -165,7 +171,7 @@ func (c *Client) send(ctx context.Context, token, environment, topic, pushType, 
 		req.Header.Set("apns-topic", topic)
 		req.Header.Set("apns-push-type", pushType)
 		req.Header.Set("apns-priority", priority)
-		req.Header.Set("apns-expiration", "0")
+		req.Header.Set("apns-expiration", expiration)
 		resp, err := c.http.Do(req)
 		if err != nil {
 			return fmt.Errorf("apns: %w", err)

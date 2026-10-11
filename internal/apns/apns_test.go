@@ -38,7 +38,7 @@ func TestVoIPPushHeadersPayloadAndJWT(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.URL.Path != "/3/device/abcd" || got.Header.Get("apns-topic") != "net.nemnet-lab.myvoip.voip" ||
-		got.Header.Get("apns-push-type") != "voip" || got.Header.Get("apns-priority") != "10" || got.Header.Get("apns-expiration") != "0" {
+		got.Header.Get("apns-push-type") != "voip" || got.Header.Get("apns-priority") != "10" || got.Header.Get("apns-expiration") != "31" {
 		t.Fatalf("headers %v", got.Header)
 	}
 	if body["call_id"] != "c1" || body["aps"] == nil || body["caller_number"] != "201" {
