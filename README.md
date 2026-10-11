@@ -225,7 +225,8 @@ Stasis(myvoip,201)
 | ログ | `docker compose logs -f myvoip`（呼ごとの `call_id` で追跡できる） |
 | 端末一覧 | `docker compose exec myvoip myvoip-server devices` |
 | 端末の失効 | `docker compose exec myvoip myvoip-server revoke-device --device d-xxxx` |
-| 更新 | `docker compose up -d --build` |
+| 更新 | `docker compose up -d --build`（すべて）。myvoip だけなら `docker compose up -d --build --no-deps myvoip`（中継用 Asterisk を再起動しない。中継用 Asterisk の再起動は通話が切れるので、通話のない時間に行う） |
+| 中継用 Asterisk の設定を反映し直す | `docker compose exec myvoip myvoip-server relay sync`（通話は切れない） |
 | バックアップ | `docker compose exec -T db pg_dump -U myvoip myvoip \| gzip > backup-$(date +%F).sql.gz`（`.env` と `secrets/` も別途保管） |
 
 - 履歴は180日を過ぎると自動で削除します。
