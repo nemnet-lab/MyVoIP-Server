@@ -94,12 +94,12 @@ func (f *fakeARI) EndpointState(_ context.Context, tech, resource string) (strin
 	}
 	return f.state, nil
 }
-func (f *fakeARI) Play(_ context.Context, ch, media, id string) error {
-	f.record("play " + ch + " " + media + " " + id)
+func (f *fakeARI) PlayOnBridge(_ context.Context, bridge, media, id string) error {
+	f.record("play " + bridge + " " + media + " " + id)
 	return nil
 }
-func (f *fakeARI) Record(_ context.Context, ch, name string, max int) error {
-	f.record("record " + ch + " " + name)
+func (f *fakeARI) RecordBridge(_ context.Context, bridge, name string, max int) error {
+	f.record("record " + bridge + " " + name)
 	if f.failRecord {
 		return fmt.Errorf("Unrecognized recording error: No such file or directory")
 	}
@@ -434,7 +434,7 @@ func TestTestCallProceedsWhenPromptNeverFinishes(t *testing.T) {
 	devCh := "myvoip-dev-" + id
 	waitFor(t, func() bool { return f.ari.has("dial " + devCh) })
 	f.ctrl.HandleEvent(ari.Event{Type: "ChannelStateChange", Channel: &ari.Channel{ID: devCh, State: "Up"}})
-	waitFor(t, func() bool { return f.ari.has("record " + devCh) })
+	waitFor(t, func() bool { return f.ari.has("record myvoip-br-" + id) })
 	// 遅れて届いた終了通知で二重に録音しない
 	f.ctrl.HandleEvent(ari.Event{Type: "PlaybackFinished", Playback: &ari.Playback{ID: testPlaybackID(id, 1), State: "failed"}})
 	f.ari.mu.Lock()
@@ -447,6 +447,30 @@ func TestTestCallProceedsWhenPromptNeverFinishes(t *testing.T) {
 	f.ari.mu.Unlock()
 	if records != 1 {
 		t.Fatalf("recorded %d times", records)
+	}
+}
+
+func TestTestCallRecordingFailedEventEndsGracefully(t *testing.T) {
+	f := newFixture(t, 30*time.Second)
+	id, _ := f.ctrl.StartTestCall(context.Background(), f.device)
+	<-f.push.sent
+	f.ctrl.HandleEvent(ari.Event{Type: "ContactStatusChange", Endpoint: &ari.EndpointInfo{Resource: "201"},
+		ContactInfo: &ari.ContactInfo{URI: "sip:201@100.100.56.35:1;myvoip-reg=q1", ContactStatus: "Reachable"}})
+	_, _ = f.ctrl.Ready(context.Background(), "d-1", id, "q1")
+	devCh := "myvoip-dev-" + id
+	waitFor(t, func() bool { return f.ari.has("dial " + devCh) })
+	f.ctrl.HandleEvent(ari.Event{Type: "ChannelStateChange", Channel: &ari.Channel{ID: devCh, State: "Up"}})
+	f.ctrl.HandleEvent(ari.Event{Type: "PlaybackFinished", Playback: &ari.Playback{ID: testPlaybackID(id, 1), State: "done"}})
+	f.ctrl.HandleEvent(ari.Event{Type: "RecordingFailed", Recording: &ari.Recording{Name: testRecordingName(id), State: "failed", Cause: "test"}})
+	if f.status(id).State == StateEnded {
+		t.Fatal("must not end immediately")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && f.status(id).State != StateEnded {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if st := f.status(id); st.State != StateEnded || *st.EndReason != ReasonCompleted {
+		t.Fatalf("expected completed, got %+v", st)
 	}
 }
 
@@ -525,15 +549,16 @@ func TestTestCallPlaysRecordsAndEnds(t *testing.T) {
 		t.Fatalf("test call must target the contact from the event, ops=%v", f.ari.ops)
 	}
 	f.ctrl.HandleEvent(ari.Event{Type: "ChannelStateChange", Channel: &ari.Channel{ID: devCh, State: "Up"}})
-	if !f.ari.has("play " + devCh + " sound:vm-intro") {
-		t.Fatal("prompt not played")
+	br := "myvoip-br-" + id
+	if !f.ari.has("add "+br+" "+devCh) || !f.ari.has("play "+br+" sound:vm-intro") {
+		t.Fatalf("prompt must be played on the test bridge, ops=%v", f.ari.ops)
 	}
 	f.ctrl.HandleEvent(ari.Event{Type: "PlaybackFinished", Playback: &ari.Playback{ID: testPlaybackID(id, 1)}})
-	if !f.ari.has("record " + devCh) {
-		t.Fatal("not recording")
+	if !f.ari.has("record " + br) {
+		t.Fatal("not recording the bridge")
 	}
 	f.ctrl.HandleEvent(ari.Event{Type: "RecordingFinished", Recording: &ari.Recording{Name: testRecordingName(id)}})
-	if !f.ari.has("play " + devCh + " recording:") {
+	if !f.ari.has("play " + br + " recording:") {
 		t.Fatal("recording not played back")
 	}
 	f.ctrl.HandleEvent(ari.Event{Type: "PlaybackFinished", Playback: &ari.Playback{ID: testPlaybackID(id, 2)}})

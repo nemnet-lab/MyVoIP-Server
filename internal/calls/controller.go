@@ -58,8 +58,8 @@ type ARI interface {
 	DestroyBridge(ctx context.Context, bridgeID string) error
 	GetChannelVar(ctx context.Context, channelID, name string) (string, error)
 	EndpointState(ctx context.Context, tech, resource string) (string, error)
-	Play(ctx context.Context, channelID, media, playbackID string) error
-	Record(ctx context.Context, channelID, name string, maxSeconds int) error
+	PlayOnBridge(ctx context.Context, bridgeID, media, playbackID string) error
+	RecordBridge(ctx context.Context, bridgeID, name string, maxSeconds int) error
 	DeleteStoredRecording(ctx context.Context, name string) error
 }
 
@@ -230,16 +230,23 @@ func (c *Controller) HandleEvent(ev ari.Event) {
 		if ev.Peer != nil && ev.DialStatus == "ANSWER" {
 			c.onDeviceUp(ev.Peer.ID)
 		}
+	case "PlaybackStarted":
+		if ev.Playback != nil && strings.HasPrefix(ev.Playback.ID, "myvoip-test-") {
+			c.log.Info("test playback started", "playback_id", ev.Playback.ID, "media", ev.Playback.MediaURI)
+		}
 	case "PlaybackFinished":
 		if ev.Playback != nil {
+			if strings.HasPrefix(ev.Playback.ID, "myvoip-test-") {
+				c.log.Info("test playback finished", "playback_id", ev.Playback.ID, "state", ev.Playback.State)
+			}
 			if ev.Playback.State == "failed" {
 				c.log.Warn("playback failed (sound file missing?)", "playback_id", ev.Playback.ID, "media", ev.Playback.MediaURI)
 			}
 			c.onPlaybackFinished(ev.Playback.ID)
 		}
-	case "RecordingFinished", "RecordingFailed":
+	case "RecordingStarted", "RecordingFinished", "RecordingFailed":
 		if ev.Recording != nil {
-			c.onRecordingFinished(ev.Recording.Name)
+			c.onRecordingEvent(ev.Type, *ev.Recording)
 		}
 	case "ContactStatusChange":
 		c.onContactStatus(ev.Endpoint, ev.ContactInfo)
@@ -606,18 +613,14 @@ func (c *Controller) onDeviceAnswered(callID, channelID string) {
 		a.testTimer = time.AfterFunc(40*time.Second, func() { c.endByID(callID, ReasonCompleted) })
 		// ガイダンスの終了通知が来なくても（音声ファイルがない場合など）録音へ進む
 		time.AfterFunc(c.opts.TestPromptLimit, func() {
-			c.log.Warn("test prompt did not finish in time; continuing to recording", "call_id", callID)
-			c.advanceTestToRecording(callID)
+			c.advanceTestToRecording(callID, "prompt did not finish in time")
 		})
 	}
 	c.mu.Unlock()
 
 	c.log.Info("device answered", "call_id", callID)
 	if isTest {
-		if err := c.ari.Play(ctx, channelID, c.opts.TestSound, testPlaybackID(callID, 1)); err != nil {
-			c.log.Warn("test prompt failed", "error", err, "media", c.opts.TestSound)
-			c.advanceTestToRecording(callID)
-		}
+		c.startTestCallMedia(callID, channelID, bridgeID)
 		return
 	}
 	err := c.ari.Answer(ctx, callerChannel)
@@ -825,14 +828,35 @@ func (c *Controller) onPlaybackFinished(playbackID string) {
 	callID, step := rest[:idx], rest[idx+1:]
 	switch step {
 	case "1":
-		c.advanceTestToRecording(callID)
+		c.advanceTestToRecording(callID, "prompt finished")
 	case "2":
 		c.endByID(callID, ReasonCompleted)
 	}
 }
 
+// startTestCallMedia はテスト着信の音声を始める。端末レッグは発呼時の保留用ブリッジに入っているため、
+// チャネル単位ではなく、専用のブリッジに入れてからブリッジに対して再生・録音する。
+func (c *Controller) startTestCallMedia(callID, channelID, bridgeID string) {
+	ctx, cancel := ctxTimeout()
+	defer cancel()
+	err := c.ari.CreateBridge(ctx, bridgeID)
+	if err == nil {
+		err = c.ari.AddToBridge(ctx, bridgeID, channelID)
+	}
+	if err != nil {
+		c.log.Error("test bridge failed", "call_id", callID, "error", err)
+		c.endByID(callID, ReasonServerError)
+		return
+	}
+	c.log.Info("test prompt requested", "call_id", callID, "media", c.opts.TestSound)
+	if err := c.ari.PlayOnBridge(ctx, bridgeID, c.opts.TestSound, testPlaybackID(callID, 1)); err != nil {
+		c.log.Warn("test prompt failed", "call_id", callID, "error", err, "media", c.opts.TestSound)
+		c.advanceTestToRecording(callID, "prompt failed")
+	}
+}
+
 // advanceTestToRecording はテスト着信をガイダンスから録音へ1回だけ進める。
-func (c *Controller) advanceTestToRecording(callID string) {
+func (c *Controller) advanceTestToRecording(callID, reason string) {
 	c.mu.Lock()
 	a := c.calls[callID]
 	if a == nil || a.testStep != 1 || a.call.State != StateConnected {
@@ -840,15 +864,13 @@ func (c *Controller) advanceTestToRecording(callID string) {
 		return
 	}
 	a.testStep = 2
-	channelID := a.call.DeviceChannel
+	bridgeID := a.bridgeID
 	c.mu.Unlock()
-	c.startTestRecording(callID, channelID)
-}
 
-func (c *Controller) startTestRecording(callID, channelID string) {
 	ctx, cancel := ctxTimeout()
 	defer cancel()
-	if err := c.ari.Record(ctx, channelID, testRecordingName(callID), 4); err != nil {
+	c.log.Info("test recording requested", "call_id", callID, "reason", reason)
+	if err := c.ari.RecordBridge(ctx, bridgeID, testRecordingName(callID), 4); err != nil {
 		// 録音できなくても受話（ガイダンス）は確認できているので、少し待ってから正常に終える。
 		// ARI の録音には <astspooldir>/recording が必要
 		c.log.Warn("test recording failed; ending test call without echo", "call_id", callID, "error", err)
@@ -856,24 +878,35 @@ func (c *Controller) startTestRecording(callID, channelID string) {
 	}
 }
 
-func (c *Controller) onRecordingFinished(name string) {
-	if !strings.HasPrefix(name, "myvoip-test-") {
+// onRecordingEvent はテスト着信の録音の開始・終了・失敗。
+func (c *Controller) onRecordingEvent(eventType string, rec ari.Recording) {
+	if !strings.HasPrefix(rec.Name, "myvoip-test-") {
 		return
 	}
-	callID := strings.TrimPrefix(name, "myvoip-test-")
+	callID := strings.TrimPrefix(rec.Name, "myvoip-test-")
+	switch eventType {
+	case "RecordingStarted":
+		c.log.Info("test recording started", "call_id", callID)
+		return
+	case "RecordingFailed":
+		c.log.Warn("test recording failed; ending test call without echo", "call_id", callID, "cause", rec.Cause, "state", rec.State)
+		time.AfterFunc(3*time.Second, func() { c.endByID(callID, ReasonCompleted) })
+		return
+	}
+	c.log.Info("test recording finished", "call_id", callID, "state", rec.State)
 	c.mu.Lock()
 	a := c.calls[callID]
-	var channelID string
-	if a != nil {
-		channelID = a.call.DeviceChannel
-	}
-	c.mu.Unlock()
-	if a == nil {
+	if a == nil || a.testStep != 2 {
+		c.mu.Unlock()
 		return
 	}
+	a.testStep = 3
+	bridgeID := a.bridgeID
+	c.mu.Unlock()
 	ctx, cancel := ctxTimeout()
 	defer cancel()
-	if err := c.ari.Play(ctx, channelID, "recording:"+name, testPlaybackID(callID, 2)); err != nil {
+	if err := c.ari.PlayOnBridge(ctx, bridgeID, "recording:"+rec.Name, testPlaybackID(callID, 2)); err != nil {
+		c.log.Warn("test echo playback failed", "call_id", callID, "error", err)
 		c.endByID(callID, ReasonCompleted)
 	}
 }
