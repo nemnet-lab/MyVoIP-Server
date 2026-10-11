@@ -56,6 +56,30 @@ type Config struct {
 	APNSEndpoint string
 	// AllowedClients は API に接続できるクライアントのアドレス帯（MYVOIP_ALLOWED_CLIENT_CIDRS）
 	AllowedClients []netip.Prefix
+
+	// Web 管理画面（DISCORD_CLIENT_ID を設定すると有効になる）
+	Web WebConfig
+}
+
+// WebConfig は Discord でログインする Web 管理画面の設定。
+type WebConfig struct {
+	Enabled             bool
+	DiscordClientID     string
+	DiscordClientSecret string
+	// DiscordGuildID を指定すると、そのサーバー（ギルド）のメンバーだけがログインできる
+	DiscordGuildID string
+	// DiscordRoleIDs を指定すると、そのロールのどれかを持つメンバーだけがログインできる
+	DiscordRoleIDs []string
+	// AllowedUserIDs はギルドに関係なくログインできる Discord ユーザー ID
+	AllowedUserIDs []string
+	// AdminIDs は管理者の Discord ユーザー ID（常にログインでき、管理画面を使える）
+	AdminIDs []string
+	// MaxPhonesPerUser は利用者1人が作成できる iPhone（内線）の上限
+	MaxPhonesPerUser int
+	SessionTTL       time.Duration
+	SupportCodeTTL   time.Duration
+	// SupportSessionTTL は管理者がパスコードで利用者の画面を開ける時間
+	SupportSessionTTL time.Duration
 }
 
 func env(key, def string) string {
@@ -72,6 +96,17 @@ func envInt(key string, def int) int {
 		}
 	}
 	return def
+}
+
+// list はカンマ区切りの値を分ける。
+func list(v string) []string {
+	var out []string
+	for _, item := range strings.Split(v, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 // Load は環境変数を読む。`requireRuntime` が false なら管理コマンド用に最小限だけ検証する。
@@ -111,6 +146,20 @@ func Load(requireRuntime bool) (Config, error) {
 		UpstreamSIPPort: envInt("UPSTREAM_SIP_PORT", 5060),
 		APNSEndpoint:    strings.TrimRight(env("APNS_ENDPOINT", ""), "/"),
 	}
+
+	c.Web = WebConfig{
+		DiscordClientID:     env("DISCORD_CLIENT_ID", ""),
+		DiscordClientSecret: env("DISCORD_CLIENT_SECRET", ""),
+		DiscordGuildID:      env("DISCORD_GUILD_ID", ""),
+		DiscordRoleIDs:      list(env("DISCORD_ROLE_IDS", "")),
+		AllowedUserIDs:      list(env("DISCORD_ALLOWED_USER_IDS", "")),
+		AdminIDs:            list(env("MYVOIP_ADMIN_DISCORD_IDS", "")),
+		MaxPhonesPerUser:    envInt("MYVOIP_MAX_PHONES_PER_USER", 3),
+		SessionTTL:          time.Duration(envInt("WEB_SESSION_HOURS", 168)) * time.Hour,
+		SupportCodeTTL:      time.Duration(envInt("SUPPORT_PASSCODE_MINUTES", 30)) * time.Minute,
+		SupportSessionTTL:   time.Duration(envInt("SUPPORT_SESSION_MINUTES", 60)) * time.Minute,
+	}
+	c.Web.Enabled = c.Web.DiscordClientID != ""
 
 	var errs []string
 	need := func(name, v string) {
@@ -166,6 +215,18 @@ func Load(requireRuntime bool) (Config, error) {
 		need("APNS_TEAM_ID", c.APNSTeamID)
 		if _, err := os.Stat(c.APNSKeyFile); err != nil {
 			errs = append(errs, fmt.Sprintf("APNs key file not readable: %s", c.APNSKeyFile))
+		}
+	}
+	if c.Web.Enabled {
+		need("DISCORD_CLIENT_SECRET", c.Web.DiscordClientSecret)
+		if len(c.Web.AdminIDs) == 0 {
+			errs = append(errs, "MYVOIP_ADMIN_DISCORD_IDS is required when the web console is enabled")
+		}
+		if c.Web.MaxPhonesPerUser < 1 || c.Web.MaxPhonesPerUser > 20 {
+			errs = append(errs, "MYVOIP_MAX_PHONES_PER_USER must be between 1 and 20")
+		}
+		if c.Web.DiscordGuildID == "" && len(c.Web.DiscordRoleIDs) > 0 {
+			errs = append(errs, "DISCORD_ROLE_IDS requires DISCORD_GUILD_ID")
 		}
 	}
 	// 呼出期限は 15〜60 秒（F-15）

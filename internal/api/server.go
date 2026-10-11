@@ -36,6 +36,8 @@ type Config struct {
 	// AllowedClients は API に接続できるクライアントのアドレス帯。空なら制限しない
 	//（例: Tailnet だけに絞るなら 100.64.0.0/10）。ループバックは常に許可する
 	AllowedClients []netip.Prefix
+	// Web は Web 管理画面（/v1/ 以外の経路）。nil なら載せない
+	Web http.Handler
 }
 
 type Server struct {
@@ -69,6 +71,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/history", s.auth(s.history))
 	mux.HandleFunc("DELETE /v1/history/{id}", s.auth(s.deleteHistory))
 	mux.HandleFunc("DELETE /v1/history", s.auth(s.deleteAllHistory))
+	if s.cfg.Web != nil {
+		// API と同じアドレス帯の制限・記録の内側に載せる
+		mux.Handle("/", s.cfg.Web)
+	}
 	return s.logRequests(s.restrictClients(mux))
 }
 

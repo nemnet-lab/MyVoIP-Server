@@ -1,0 +1,99 @@
+{{define "content"}}
+{{$csrf := .CSRF}}{{$base := .Data.Base}}
+<section class="card">
+  <h2>iPhone</h2>
+  {{if .Data.Phones}}
+  <ul class="phones">
+    {{range .Data.Phones}}
+    <li class="phone">
+      <div class="phone-head">
+        <strong>{{.Label}}</strong>
+        <span class="muted">内線 {{.Number}}{{if .DisplayName}}（{{.DisplayName}}）{{end}}</span>
+      </div>
+      {{if .Enrolled}}
+      <p class="status ok">登録済み：{{.DeviceName}}{{if .AppVersion}}（アプリ {{.AppVersion}}）{{end}}・{{datetime .EnrolledAt}}</p>
+      {{if not .PushReady}}<p class="status warn">着信の準備ができていません。アプリを一度開いてください。</p>{{end}}
+      {{if not .Enabled}}<p class="status warn">アプリで着信を停止しています。</p>{{end}}
+      {{else}}
+      <p class="status warn">未登録：「登録コードを発行」を押して、表示されたコードをアプリに入力してください。</p>
+      {{end}}
+      <div class="actions">
+        <form method="post" action="{{$base}}/phones/{{.Number}}/code" class="inline">
+          <input type="hidden" name="csrf" value="{{$csrf}}">
+          <button class="primary">{{if .Enrolled}}登録コードを再発行（機種変更）{{else}}登録コードを発行{{end}}</button>
+        </form>
+        <details>
+          <summary>名前の変更・削除</summary>
+          <form method="post" action="{{$base}}/phones/{{.Number}}/rename" class="row">
+            <input type="hidden" name="csrf" value="{{$csrf}}">
+            <input name="label" value="{{.Label}}" maxlength="40" aria-label="名前">
+            <button>名前を変更</button>
+          </form>
+          <form method="post" action="{{$base}}/phones/{{.Number}}/delete" class="row" data-confirm="「{{.Label}}」を削除します。この iPhone のアプリは着信・発信できなくなります。よろしいですか？">
+            <input type="hidden" name="csrf" value="{{$csrf}}">
+            <button class="danger">この iPhone を削除</button>
+          </form>
+        </details>
+      </div>
+    </li>
+    {{end}}
+  </ul>
+  {{else}}
+  <p>まだ iPhone がありません。下の「iPhone を追加」から作成してください。</p>
+  {{end}}
+
+  {{if .Data.CanAdd}}
+    {{if .Data.NoFree}}
+    <p class="status warn">割り当てられる内線が残っていないため、いまは追加できません。管理者に依頼してください。</p>
+    {{else}}
+    <form method="post" action="{{$base}}/phones" class="row add">
+      <input type="hidden" name="csrf" value="{{$csrf}}">
+      <input name="label" placeholder="名前（例：仕事用 iPhone）" maxlength="40" aria-label="名前">
+      <button class="primary">iPhone を追加</button>
+    </form>
+    <p class="muted">1台につき内線がひとつ割り当てられます（{{.Data.Max}} 台まで）。</p>
+    {{end}}
+  {{else}}
+  <p class="muted">iPhone は {{.Data.Max}} 台まで作成できます。</p>
+  {{end}}
+</section>
+
+{{if eq $base ""}}
+<section class="card">
+  <h2>サポート用パスコード</h2>
+  <p>管理者にサポートを依頼するときに発行し、パスコードを管理者に伝えてください。管理者はこのパスコードで、一定時間だけあなたの画面を開いて操作できます。</p>
+  {{if .Data.Passcode}}
+  <p class="status ok">発行済みのパスコードがあります（{{clock .Data.Passcode.ExpiresAt}} まで有効・1回限り）。</p>
+  <div class="actions">
+    <form method="post" action="/support-passcode" class="inline">
+      <input type="hidden" name="csrf" value="{{$csrf}}">
+      <button>発行し直す</button>
+    </form>
+    <form method="post" action="/support-passcode/delete" class="inline">
+      <input type="hidden" name="csrf" value="{{$csrf}}">
+      <button>取り消す</button>
+    </form>
+  </div>
+  {{else}}
+  <form method="post" action="/support-passcode" class="inline">
+    <input type="hidden" name="csrf" value="{{$csrf}}">
+    <button class="primary">サポート用パスコードを発行</button>
+  </form>
+  {{end}}
+</section>
+{{end}}
+
+{{if .Data.Audit}}
+<section class="card">
+  <h2>操作の記録</h2>
+  <table class="list">
+    <thead><tr><th>日時</th><th>操作した人</th><th>内容</th></tr></thead>
+    <tbody>
+    {{range .Data.Audit}}
+    <tr><td>{{datetime .At}}</td><td>{{.Actor}}</td><td>{{.Action}}{{if .Detail}}：{{.Detail}}{{end}}</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+</section>
+{{end}}
+{{end}}

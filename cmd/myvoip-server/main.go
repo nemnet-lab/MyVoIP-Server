@@ -35,6 +35,7 @@ import (
 	"github.com/nemnet-lab/MyVoIP-Server/internal/relay"
 	"github.com/nemnet-lab/MyVoIP-Server/internal/secret"
 	"github.com/nemnet-lab/MyVoIP-Server/internal/store"
+	"github.com/nemnet-lab/MyVoIP-Server/internal/web"
 )
 
 func main() {
@@ -76,7 +77,7 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, `使い方:
   myvoip-server serve
-  myvoip-server extension set --number 201 [--display-name 名前] [--sip-user 201] [--auth-user 201] [--endpoint 201] [--ring-timeout 30]
+  myvoip-server extension set --number 201 [--display-name 名前] [--sip-user 201] [--auth-user 201] [--endpoint 201] [--ring-timeout 30] [--pool]
       （SIP パスワードは標準入力または環境変数 SIP_PASSWORD で渡す）
   myvoip-server extension list
   myvoip-server enroll-code --extension 201
@@ -144,6 +145,25 @@ func serve(log *slog.Logger) error {
 	go ariClient.Run(ctx, controller.HandleEvent)
 	go retentionLoop(ctx, db, cfg.HistoryRetention, log)
 
+	var webHandler http.Handler
+	if cfg.Web.Enabled {
+		var syncer web.Syncer
+		if cfg.RelayEnabled {
+			syncer = func(ctx context.Context) error {
+				return relay.Sync(ctx, db, box, relayOptions(cfg), cfg.RelayConfigDir, ariClient)
+			}
+		}
+		webServer, err := web.New(db, box, web.Config{
+			PublicURL: cfg.PublicURL, EnrollmentCodeTTL: cfg.EnrollmentCodeTTL, Relay: cfg.RelayEnabled, Web: cfg.Web,
+		}, syncer, log)
+		if err != nil {
+			return err
+		}
+		webHandler = webServer.Handler()
+		log.Info("web console enabled", "url", cfg.PublicURL+"/", "redirect_uri", cfg.PublicURL+"/auth/discord/callback",
+			"guild_restricted", cfg.Web.DiscordGuildID != "", "admins", len(cfg.Web.AdminIDs))
+	}
+
 	apiServer := api.New(db, controller, box, api.Config{
 		SIPDomain:       cfg.SIPDomain,
 		SIPProxyHost:    cfg.SIPProxyHost,
@@ -156,6 +176,7 @@ func serve(log *slog.Logger) error {
 		RingTimeout:     cfg.RingTimeout,
 		AllowedClients:  cfg.AllowedClients,
 		Relay:           cfg.RelayEnabled,
+		Web:             webHandler,
 	}, log)
 	httpServer := &http.Server{
 		Addr:              cfg.Listen,
@@ -314,9 +335,25 @@ func extensionCmd(args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("%-8s %-20s %-10s %-10s %s\n", "内線", "表示名", "SIPユーザー", "エンドポイント", "呼出秒")
+		users, err := db.ListUsers(ctx)
+		if err != nil {
+			return err
+		}
+		names := map[string]string{}
+		for _, u := range users {
+			names[u.ID] = u.DisplayName
+		}
+		fmt.Printf("%-8s %-20s %-10s %-10s %-6s %-8s %s\n", "内線", "表示名", "SIPユーザー", "エンドポイント", "呼出秒", "割当用", "利用者")
 		for _, e := range list {
-			fmt.Printf("%-8s %-20s %-10s %-10s %d\n", e.Number, e.DisplayName, e.SIPUsername, e.Endpoint, e.RingTimeoutSeconds)
+			pool := "-"
+			if e.Pool {
+				pool = "はい"
+			}
+			owner := "-"
+			if e.OwnerUserID != "" {
+				owner = names[e.OwnerUserID] + "（" + e.Label + "）"
+			}
+			fmt.Printf("%-8s %-20s %-10s %-10s %-6d %-8s %s\n", e.Number, e.DisplayName, e.SIPUsername, e.Endpoint, e.RingTimeoutSeconds, pool, owner)
 		}
 		return nil
 	case "set":
@@ -330,6 +367,7 @@ func extensionCmd(args []string) error {
 	authUser := fs.String("auth-user", "", "SIP 認証ユーザー名（省略時は SIP ユーザー名）")
 	endpoint := fs.String("endpoint", "", "端末レッグを発呼する PJSIP エンドポイント名（省略時は SIP ユーザー名）")
 	ring := fs.Int("ring-timeout", 30, "呼出秒数（15〜60）")
+	pool := fs.Bool("pool", false, "Web 管理画面で利用者に割り当てる内線にする")
 	_ = fs.Parse(args[1:])
 	if *number == "" {
 		return errors.New("--number is required")
@@ -375,7 +413,15 @@ func extensionCmd(args []string) error {
 	if err != nil {
 		return err
 	}
+	if *pool {
+		if err := db.SetExtensionPool(ctx, *number, true); err != nil {
+			return err
+		}
+	}
 	fmt.Printf("内線 %s を登録しました（SIP ユーザー %s、エンドポイント PJSIP/%s）。\n", *number, *sipUser, *endpoint)
+	if *pool {
+		fmt.Println("Web 管理画面で利用者に割り当てる内線にしました（割り当てるまで MikoPBX には登録しません）。")
+	}
 	if cfg.RelayEnabled {
 		// 中継用 Asterisk が MikoPBX にこの内線として登録するよう、設定を反映する
 		if err := relaySync(ctx, cfg, db); err != nil {

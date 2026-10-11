@@ -106,12 +106,27 @@ func (p *Postgres) UpsertExtension(ctx context.Context, e Extension) error {
 	return err
 }
 
-const extensionColumns = `number, display_name, sip_username, sip_auth_username, sip_password_enc, endpoint, ring_timeout_seconds, updated_at, mobile_password_enc`
+const extensionColumns = `number, display_name, sip_username, sip_auth_username, sip_password_enc, endpoint, ring_timeout_seconds, updated_at, mobile_password_enc,
+	COALESCE(owner_user_id, ''), pool, label, assigned_at`
 
 func scanExtension(row pgx.Row) (Extension, error) {
 	var e Extension
-	err := row.Scan(&e.Number, &e.DisplayName, &e.SIPUsername, &e.SIPAuthUsername, &e.SIPPasswordEnc, &e.Endpoint, &e.RingTimeoutSeconds, &e.UpdatedAt, &e.MobilePasswordEnc)
+	err := row.Scan(&e.Number, &e.DisplayName, &e.SIPUsername, &e.SIPAuthUsername, &e.SIPPasswordEnc, &e.Endpoint, &e.RingTimeoutSeconds, &e.UpdatedAt, &e.MobilePasswordEnc,
+		&e.OwnerUserID, &e.Pool, &e.Label, &e.AssignedAt)
 	return e, notFound(err)
+}
+
+func scanExtensions(rows pgx.Rows) ([]Extension, error) {
+	defer rows.Close()
+	var list []Extension
+	for rows.Next() {
+		e, err := scanExtension(rows)
+		if err != nil {
+			return nil, err
+		}
+		list = append(list, e)
+	}
+	return list, rows.Err()
 }
 
 func (p *Postgres) SetMobilePassword(ctx context.Context, number string, enc []byte) error {
@@ -130,20 +145,11 @@ func (p *Postgres) GetExtension(ctx context.Context, number string) (Extension, 
 }
 
 func (p *Postgres) ListExtensions(ctx context.Context) ([]Extension, error) {
-	rows, err := p.pool.Query(ctx, `SELECT `+extensionColumns+` FROM extensions ORDER BY number`)
+	rows, err := p.pool.Query(ctx, `SELECT `+extensionColumns+` FROM extensions ORDER BY length(number), number`)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var list []Extension
-	for rows.Next() {
-		e, err := scanExtension(rows)
-		if err != nil {
-			return nil, err
-		}
-		list = append(list, e)
-	}
-	return list, rows.Err()
+	return scanExtensions(rows)
 }
 
 // --- enrollment
@@ -388,5 +394,257 @@ func (p *Postgres) PurgeHistoryBefore(ctx context.Context, before time.Time) (in
 	_, _ = p.pool.Exec(ctx, `DELETE FROM enrollment_codes WHERE expires_at < $1`, before)
 	_, _ = p.pool.Exec(ctx, `DELETE FROM tokens WHERE expires_at < $1`, before)
 	_, _ = p.pool.Exec(ctx, `DELETE FROM calls WHERE created_at < $1`, before)
+	_, _ = p.pool.Exec(ctx, `DELETE FROM web_sessions WHERE expires_at < now()`)
+	_, _ = p.pool.Exec(ctx, `DELETE FROM support_passcodes WHERE expires_at < now()`)
+	_, _ = p.pool.Exec(ctx, `DELETE FROM audit_log WHERE at < $1`, before)
 	return tag.RowsAffected(), nil
+}
+
+// --- Web 管理画面：利用者
+
+const userColumns = `id, discord_id, discord_username, display_name, disabled, created_at, last_login_at`
+
+func scanUser(row pgx.Row) (User, error) {
+	var u User
+	err := row.Scan(&u.ID, &u.DiscordID, &u.DiscordUsername, &u.DisplayName, &u.Disabled, &u.CreatedAt, &u.LastLoginAt)
+	return u, notFound(err)
+}
+
+func (p *Postgres) UpsertDiscordUser(ctx context.Context, u User, now time.Time) (User, error) {
+	return scanUser(p.pool.QueryRow(ctx, `
+		INSERT INTO users(id, discord_id, discord_username, display_name, created_at, last_login_at)
+		VALUES ($1,$2,$3,$4,$5,$5)
+		ON CONFLICT (discord_id) DO UPDATE SET discord_username=$3, display_name=$4, last_login_at=$5
+		RETURNING `+userColumns, u.ID, u.DiscordID, u.DiscordUsername, u.DisplayName, now))
+}
+
+func (p *Postgres) GetUser(ctx context.Context, id string) (User, error) {
+	return scanUser(p.pool.QueryRow(ctx, `SELECT `+userColumns+` FROM users WHERE id=$1`, id))
+}
+
+func (p *Postgres) ListUsers(ctx context.Context) ([]User, error) {
+	rows, err := p.pool.Query(ctx, `SELECT `+userColumns+` FROM users ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var list []User
+	for rows.Next() {
+		u, err := scanUser(rows)
+		if err != nil {
+			return nil, err
+		}
+		list = append(list, u)
+	}
+	return list, rows.Err()
+}
+
+func (p *Postgres) SetUserDisabled(ctx context.Context, id string, disabled bool) error {
+	tag, err := p.pool.Exec(ctx, `UPDATE users SET disabled=$2 WHERE id=$1`, id, disabled)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// --- Web 管理画面：ログイン状態
+
+func (p *Postgres) CreateWebSession(ctx context.Context, s WebSession) error {
+	_, err := p.pool.Exec(ctx, `INSERT INTO web_sessions(hash, user_id, csrf, expires_at) VALUES ($1,$2,$3,$4)`, s.Hash, s.UserID, s.CSRF, s.ExpiresAt)
+	return err
+}
+
+func (p *Postgres) GetWebSession(ctx context.Context, hash string) (WebSession, error) {
+	var s WebSession
+	err := p.pool.QueryRow(ctx, `
+		SELECT hash, user_id, csrf, expires_at, created_at, COALESCE(support_user_id, ''), support_expires_at
+		FROM web_sessions WHERE hash=$1`, hash).
+		Scan(&s.Hash, &s.UserID, &s.CSRF, &s.ExpiresAt, &s.CreatedAt, &s.SupportUserID, &s.SupportExpiresAt)
+	return s, notFound(err)
+}
+
+func (p *Postgres) SetWebSessionSupport(ctx context.Context, hash, supportUserID string, until *time.Time) error {
+	var target any
+	if supportUserID != "" {
+		target = supportUserID
+	}
+	_, err := p.pool.Exec(ctx, `UPDATE web_sessions SET support_user_id=$2, support_expires_at=$3 WHERE hash=$1`, hash, target, until)
+	return err
+}
+
+func (p *Postgres) DeleteWebSession(ctx context.Context, hash string) error {
+	_, err := p.pool.Exec(ctx, `DELETE FROM web_sessions WHERE hash=$1`, hash)
+	return err
+}
+
+func (p *Postgres) DeleteUserWebSessions(ctx context.Context, userID string) error {
+	_, err := p.pool.Exec(ctx, `DELETE FROM web_sessions WHERE user_id=$1`, userID)
+	return err
+}
+
+// --- Web 管理画面：内線の割り当て
+
+func (p *Postgres) AssignFreeExtension(ctx context.Context, userID, label string, max int, now time.Time) (Extension, error) {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return Extension{}, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	// 同じ利用者の同時追加で上限を超えないよう、利用者の行を押さえる
+	var id string
+	if err := tx.QueryRow(ctx, `SELECT id FROM users WHERE id=$1 FOR UPDATE`, userID).Scan(&id); err != nil {
+		return Extension{}, notFound(err)
+	}
+	var owned int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM extensions WHERE owner_user_id=$1`, userID).Scan(&owned); err != nil {
+		return Extension{}, err
+	}
+	if owned >= max {
+		return Extension{}, ErrLimit
+	}
+	var number string
+	err = tx.QueryRow(ctx, `
+		SELECT number FROM extensions WHERE pool AND owner_user_id IS NULL
+		ORDER BY length(number), number LIMIT 1 FOR UPDATE SKIP LOCKED`).Scan(&number)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Extension{}, ErrNoFreeExtension
+	}
+	if err != nil {
+		return Extension{}, err
+	}
+	e, err := scanExtension(tx.QueryRow(ctx, `
+		UPDATE extensions SET owner_user_id=$2, label=$3, assigned_at=$4, updated_at=now() WHERE number=$1
+		RETURNING `+extensionColumns, number, userID, label, now))
+	if err != nil {
+		return Extension{}, err
+	}
+	return e, tx.Commit(ctx)
+}
+
+func (p *Postgres) AssignExtension(ctx context.Context, number, userID, label string, now time.Time) error {
+	tag, err := p.pool.Exec(ctx, `
+		UPDATE extensions SET owner_user_id=$2, label=$3, assigned_at=$4, updated_at=now()
+		WHERE number=$1 AND owner_user_id IS NULL`, number, userID, label, now)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (p *Postgres) ReleaseExtension(ctx context.Context, number string, now time.Time) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	tag, err := tx.Exec(ctx, `UPDATE extensions SET owner_user_id=NULL, label='', assigned_at=NULL, updated_at=now() WHERE number=$1`, number)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE tokens SET revoked_at=$2 WHERE revoked_at IS NULL AND device_id IN
+			(SELECT id FROM devices WHERE extension=$1 AND revoked_at IS NULL)`, number, now); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE devices SET revoked_at=$2, voip_token='', alert_token='' WHERE extension=$1 AND revoked_at IS NULL`, number, now); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM enrollment_codes WHERE extension=$1`, number); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM history WHERE extension=$1`, number); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) SetExtensionPool(ctx context.Context, number string, pool bool) error {
+	tag, err := p.pool.Exec(ctx, `UPDATE extensions SET pool=$2, updated_at=now() WHERE number=$1`, number, pool)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (p *Postgres) SetExtensionLabel(ctx context.Context, number, label string) error {
+	tag, err := p.pool.Exec(ctx, `UPDATE extensions SET label=$2, updated_at=now() WHERE number=$1`, number, label)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (p *Postgres) ListExtensionsByOwner(ctx context.Context, userID string) ([]Extension, error) {
+	rows, err := p.pool.Query(ctx, `SELECT `+extensionColumns+` FROM extensions WHERE owner_user_id=$1 ORDER BY assigned_at, number`, userID)
+	if err != nil {
+		return nil, err
+	}
+	return scanExtensions(rows)
+}
+
+// --- Web 管理画面：サポート用パスコード
+
+func (p *Postgres) SetSupportPasscode(ctx context.Context, c SupportPasscode) error {
+	_, err := p.pool.Exec(ctx, `
+		INSERT INTO support_passcodes(user_id, code_hash, expires_at, created_at) VALUES ($1,$2,$3,now())
+		ON CONFLICT (user_id) DO UPDATE SET code_hash=$2, expires_at=$3, created_at=now()`, c.UserID, c.CodeHash, c.ExpiresAt)
+	return err
+}
+
+func (p *Postgres) GetSupportPasscode(ctx context.Context, userID string) (SupportPasscode, error) {
+	var c SupportPasscode
+	err := p.pool.QueryRow(ctx, `SELECT user_id, code_hash, expires_at, created_at FROM support_passcodes WHERE user_id=$1`, userID).
+		Scan(&c.UserID, &c.CodeHash, &c.ExpiresAt, &c.CreatedAt)
+	return c, notFound(err)
+}
+
+func (p *Postgres) DeleteSupportPasscode(ctx context.Context, userID string) error {
+	_, err := p.pool.Exec(ctx, `DELETE FROM support_passcodes WHERE user_id=$1`, userID)
+	return err
+}
+
+func (p *Postgres) ConsumeSupportPasscode(ctx context.Context, codeHash string, now time.Time) (string, error) {
+	var userID string
+	err := p.pool.QueryRow(ctx, `DELETE FROM support_passcodes WHERE code_hash=$1 AND expires_at > $2 RETURNING user_id`, codeHash, now).Scan(&userID)
+	return userID, notFound(err)
+}
+
+// --- Web 管理画面：操作記録
+
+func (p *Postgres) AddAudit(ctx context.Context, a AuditEntry) error {
+	_, err := p.pool.Exec(ctx, `INSERT INTO audit_log(at, user_id, actor_user_id, action, detail) VALUES ($1,$2,$3,$4,$5)`,
+		a.At, a.UserID, a.ActorUserID, a.Action, a.Detail)
+	return err
+}
+
+func (p *Postgres) ListAudit(ctx context.Context, userID string, limit int) ([]AuditEntry, error) {
+	rows, err := p.pool.Query(ctx, `SELECT id, at, user_id, actor_user_id, action, detail FROM audit_log WHERE user_id=$1 ORDER BY at DESC, id DESC LIMIT $2`, userID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var list []AuditEntry
+	for rows.Next() {
+		var a AuditEntry
+		if err := rows.Scan(&a.ID, &a.At, &a.UserID, &a.ActorUserID, &a.Action, &a.Detail); err != nil {
+			return nil, err
+		}
+		list = append(list, a)
+	}
+	return list, rows.Err()
 }

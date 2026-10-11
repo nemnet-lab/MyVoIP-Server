@@ -1,0 +1,43 @@
+{{define "layout"}}<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>{{.Title}} - MyVoIP</title>
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="/">MyVoIP</a>
+  {{if .User}}
+  <nav>
+    <a href="/">あなたの iPhone</a>
+    {{if .IsAdmin}}<a href="/admin">管理</a>{{end}}
+    <span class="who">{{.User.DisplayName}}</span>
+    <form method="post" action="/logout" class="inline">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <button class="link">ログアウト</button>
+    </form>
+  </nav>
+  {{end}}
+</header>
+{{if .Support}}
+<div class="support-bar">
+  <span>サポート中：<strong>{{.Support.DisplayName}}</strong> さん（{{clock .SupportUntil}} まで）。操作は本人の画面に記録されます。</span>
+  <a href="/support">画面を開く</a>
+  <form method="post" action="/support/end" class="inline">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <button class="small">サポートを終了</button>
+  </form>
+</div>
+{{end}}
+<main>
+  <h1>{{.Title}}</h1>
+  {{if .Notice}}<p class="notice">{{.Notice}}</p>{{end}}
+  {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
+  {{template "content" .}}
+</main>
+</body>
+</html>{{end}}

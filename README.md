@@ -4,6 +4,7 @@
 
 - MikoPBX（Asterisk）の ARI で着信を保持し、APNs の VoIP Push で iPhone を起こしてからつなぐ
 - アプリ用の HTTP(S) API（[docs/api.md](docs/api.md)）と管理コマンド（内線登録・登録コード発行・端末管理）
+- Discord でログインする Web 管理画面（利用者が自分の iPhone を作成して登録コードを発行する・サポート用パスコード）
 - リバースプロキシは Caddy か Nginx を選べる
 
 iPhone アプリ本体は別リポジトリ（非公開）です。
@@ -164,6 +165,32 @@ docker compose exec myvoip myvoip-server enroll-code --extension 201
 | `--auth-user` | SIP ユーザー名 | 認証ユーザー名 |
 | `--endpoint` | SIP ユーザー名 | 端末へ発呼する PJSIP エンドポイント名 |
 | `--ring-timeout` | 30 | 呼出秒数（15〜60） |
+
+### Web 管理画面（Discord でログイン）
+
+複数の利用者に使ってもらう場合は、Web 管理画面を有効にすると、利用者が自分で iPhone を作成して登録コードを発行できます。画面は API と同じアドレス（`MYVOIP_PUBLIC_URL`）で開き、`MYVOIP_ALLOWED_CLIENT_CIDRS` の制限も同じく受けます。
+
+| 利用者ができること | 内容 |
+|---|---|
+| iPhone を追加 | 「割り当て用」の空き内線を、番号の小さい順に1台につき1つ割り当てる（1内線につき iPhone 1台）。上限は `MYVOIP_MAX_PHONES_PER_USER`（既定 3） |
+| 登録コードを発行 | アプリに入力する設定 URL・登録コード（10分・1回限り）と QR を表示する。機種変更のときも再発行する |
+| iPhone を削除 | 端末を失効し、その内線の履歴を消して割り当てを外す。中継モードでは中継用のパスワードも作り直す |
+| サポート用パスコード | 数字8桁（`SUPPORT_PASSCODE_MINUTES`、既定30分・1回限り）。管理者に伝えると、管理者が `SUPPORT_SESSION_MINUTES`（既定60分）だけ利用者の画面を開いて操作できる。管理者の操作は利用者の画面の「操作の記録」に表示される |
+
+管理者（`MYVOIP_ADMIN_DISCORD_IDS`）は「管理」画面で、サポートの開始、内線の追加・「割り当て用」の切り替え・割り当て・解除、利用者のログイン停止ができます。
+
+**設定手順**
+
+1. [Discord Developer Portal](https://discord.com/developers/applications) でアプリケーションを作成し、「OAuth2」で Client ID と Client Secret を控える。
+2. 同じ画面の Redirects に `MYVOIP_PUBLIC_URL` + `/auth/discord/callback`（例 `http://100.x.y.z/auth/discord/callback`）を登録する。認可コードの交換はこのサーバーから Discord へ送るため、Discord からこのサーバーへ届く必要はありません（Tailnet 内だけでも動きます）。
+   - http のアドレスを Discord が受け付けない場合は、Tailscale の MagicDNS 名で HTTPS にします（`tailscale cert <名前>.<tailnet>.ts.net` で証明書を作って `certs/` に置き、`MYVOIP_TLS=files`、`MYVOIP_PUBLIC_URL=https://<名前>.<tailnet>.ts.net`）。
+3. `.env` に `DISCORD_CLIENT_ID`・`DISCORD_CLIENT_SECRET`・`MYVOIP_ADMIN_DISCORD_IDS`（自分の Discord ユーザー ID。Discord の設定で開発者モードを有効にすると、プロフィールからコピーできる）を設定する。
+4. ログインできる人を決める。`DISCORD_GUILD_ID` を指定するとその Discord サーバーのメンバーだけ、さらに `DISCORD_ROLE_IDS` を指定するとそのロールを持つメンバーだけがログインできる。個別に許可する人は `DISCORD_ALLOWED_USER_IDS`。どれも指定しなければ管理者だけがログインできる。
+5. `docker compose up -d --build --no-deps myvoip` で反映し、`MYVOIP_PUBLIC_URL` をブラウザで開く。
+
+**内線の用意**：先に MikoPBX の画面で利用者用の内線（例 9101〜9110）を作成し、管理画面の「内線を追加・更新する」で番号と SIP パスワードを「割り当て用」として登録します（コマンドなら `extension set --number 9101 --pool`）。中継モードでは、「割り当て用」の内線は利用者に割り当てるまで MikoPBX に登録しません（MikoPBX から見て offline のまま）。すでに使っている内線（例 9002）は、管理画面の「割り当てる」で利用者の管理に移せます。
+
+> **直接モードでの注意**：直接モードでは iPhone に MikoPBX の SIP パスワードを渡すため、iPhone を削除しても、そのパスワードは iPhone に残ります。利用者を入れ替える場合は MikoPBX 側でパスワードを変更し、`extension set` で登録し直してください。複数の利用者で使う場合は中継モードを勧めます（削除のたびに中継用のパスワードを作り直します）。
 
 ## 5. テスト着信
 

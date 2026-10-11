@@ -48,3 +48,15 @@ func TestRenderRejectsUnsafeNames(t *testing.T) {
 		t.Fatal("unsafe extension number must be rejected")
 	}
 }
+
+func TestInUseSkipsUnassignedPoolExtensions(t *testing.T) {
+	exts := []store.Extension{
+		{Number: "9002"}, // 管理者が直接使う内線
+		{Number: "9101", Pool: true, OwnerUserID: "u-1"}, // 割り当て済み
+		{Number: "9102", Pool: true},                     // 未割り当て
+	}
+	got := InUse(exts)
+	if len(got) != 2 || got[0].Number != "9002" || got[1].Number != "9101" {
+		t.Fatalf("InUse = %+v", got)
+	}
+}

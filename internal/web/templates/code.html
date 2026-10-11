@@ -1,0 +1,22 @@
+{{define "content"}}
+<section class="card">
+  <h2>{{.Data.Phone.Label}}（内線 {{.Data.Phone.Number}}）</h2>
+  <p>MyVoIP アプリの初期設定で、次のどちらかの方法で登録してください。<strong>{{clock .Data.ExpiresAt}} まで有効・1回限り</strong>です。</p>
+
+  <h3>別の端末でこの画面を開いている場合：QR コードを読み取る</h3>
+  <p>アプリの「QR コードを読み取る」で読み取ります。</p>
+  <p class="qr"><img src="{{.Data.QR}}" alt="登録用 QR コード" width="256" height="256"></p>
+
+  <h3>この iPhone でこの画面を開いている場合：コピーして貼り付ける</h3>
+  <p>アプリの「設定URL」と「登録コード」に、それぞれコピーして貼り付けます。</p>
+  <dl class="credentials">
+    <dt>設定 URL</dt>
+    <dd class="row"><input class="copy-source" readonly value="{{.Data.PublicURL}}" aria-label="設定 URL"><button type="button" data-copy>コピー</button></dd>
+    <dt>登録コード</dt>
+    <dd class="row"><input class="copy-source code-input" readonly value="{{.Data.Code}}" aria-label="登録コード"><button type="button" data-copy>コピー</button></dd>
+  </dl>
+
+  <p class="muted">登録すると、この内線で以前に登録していた iPhone は使えなくなります。登録コードは他人に見せないでください。</p>
+  <p><a class="button" href="{{if .Data.Base}}{{.Data.Base}}{{else}}/{{end}}">戻る</a></p>
+</section>
+{{end}}

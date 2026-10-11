@@ -132,6 +132,18 @@ func escape(s string) string {
 	return strings.ReplaceAll(s, ";", `\;`)
 }
 
+// InUse は MikoPBX に登録する内線を返す。
+// 利用者に割り当てる予備の内線（pool）は、割り当てるまで登録しない（MikoPBX から見て offline のまま）。
+func InUse(exts []store.Extension) []store.Extension {
+	var list []store.Extension
+	for _, e := range exts {
+		if !e.Pool || e.OwnerUserID != "" {
+			list = append(list, e)
+		}
+	}
+	return list
+}
+
 // Write は設定ファイルを置き換える（途中の状態を Asterisk に読ませない）。
 func Write(dir, content string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -170,7 +182,7 @@ func Sync(ctx context.Context, st store.Store, box *secret.Box, opts Options, di
 	if err != nil {
 		return err
 	}
-	content, err := Render(exts, box, opts)
+	content, err := Render(InUse(exts), box, opts)
 	if err != nil {
 		return err
 	}

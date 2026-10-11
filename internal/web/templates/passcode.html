@@ -1,0 +1,9 @@
+{{define "content"}}
+<section class="card">
+  <p>このパスコードを管理者に伝えてください。<strong>{{clock .Data.ExpiresAt}} まで有効・1回限り</strong>です。</p>
+  <p class="passcode"><code class="big">{{.Data.Code}}</code></p>
+  <p>管理者はこのパスコードを使うと、{{.Data.Minutes}} 分間あなたの画面を開いて、iPhone の追加・削除や登録コードの発行ができます。管理者の操作は「操作の記録」に表示されます。</p>
+  <p class="muted">サポートが不要になったら、トップの画面でパスコードを取り消せます。この画面を閉じるとパスコードは再表示できません。</p>
+  <p><a class="button" href="/">戻る</a></p>
+</section>
+{{end}}
