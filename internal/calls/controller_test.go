@@ -23,6 +23,8 @@ type fakeARI struct {
 	state      string // エンドポイントの状態
 	failDial   bool
 	failRecord bool
+	// varConflicts は SetVariable が「Channel not in Stasis application」（409）を返す残り回数
+	varConflicts int
 }
 
 func (f *fakeARI) record(op string) {
@@ -56,6 +58,13 @@ func (f *fakeARI) CreateChannel(_ context.Context, endpoint, args, id string) er
 	return nil
 }
 func (f *fakeARI) SetVariable(_ context.Context, ch, name, value string) error {
+	f.mu.Lock()
+	if f.varConflicts > 0 {
+		f.varConflicts--
+		f.mu.Unlock()
+		return fmt.Errorf(`ari POST /channels/%s/variable: 409 {"message":"Channel not in Stasis application"}`, ch)
+	}
+	f.mu.Unlock()
 	f.record("var " + ch + " " + name + "=" + value)
 	return nil
 }
@@ -160,7 +169,7 @@ func newFixture(t *testing.T, ring time.Duration) *fixture {
 	d, _ = st.GetDevice(ctx, "d-1")
 	f := &fixture{t: t, store: st, ari: &fakeARI{}, push: &fakePusher{sent: make(chan struct{}, 4)}, device: d}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	f.ctrl = New(st, f.ari, f.push, logger, Options{RingTimeout: ring, ContactWait: 300 * time.Millisecond, TestPromptLimit: 300 * time.Millisecond})
+	f.ctrl = New(st, f.ari, f.push, logger, Options{RingTimeout: ring, ContactWait: 300 * time.Millisecond, TestPromptLimit: 300 * time.Millisecond, DeviceStasisWait: 50 * time.Millisecond})
 	return f
 }
 
@@ -307,6 +316,50 @@ func TestRingTimeout(t *testing.T) {
 	waitFor(t, func() bool { return f.status(id).State == StateEnded })
 	if *f.status(id).EndReason != ReasonTimeout || !f.ari.has("hangup caller-4 no_answer") {
 		t.Fatalf("expected timeout hangup, ops=%v", f.ari.ops)
+	}
+}
+
+// /channels/create の直後はまだ Stasis に入っておらず、変数の設定が 409 になることがある。待ってやり直す
+func TestDeviceLegWaitsForStasisBeforeSettingVariables(t *testing.T) {
+	f := newFixture(t, 30*time.Second)
+	f.ctrl.opts.DeviceStasisWait = 2 * time.Second
+	f.ari.varConflicts = 2
+	id := f.incoming("caller-11")
+	f.ari.contacts = "PJSIP/201/sip:201@10.0.0.5:5060;myvoip-reg=r11"
+	_, _ = f.ctrl.Ready(context.Background(), "d-1", id, "r11")
+	devCh := "myvoip-dev-" + id
+	waitFor(t, func() bool { return f.ari.has("create ") })
+	started := time.Now()
+	// 端末レッグの StasisStart で待ちが解ける（DeviceStasisWait の 2 秒を待たない）
+	f.ctrl.HandleEvent(ari.Event{Type: "StasisStart", Args: []string{"device", id}, Channel: &ari.Channel{ID: devCh}})
+	waitFor(t, func() bool { return f.ari.has("dial " + devCh + " caller=caller-11") })
+	if time.Since(started) > time.Second {
+		t.Fatal("dial should not wait for the full DeviceStasisWait after StasisStart")
+	}
+	if !f.ari.has("var " + devCh + " PJSIP_HEADER(add,X-MyVoIP-Call-ID)=" + id) {
+		t.Fatal("correlation header must be set after retrying 409")
+	}
+	if f.status(id).State == StateEnded {
+		t.Fatal("call must not end on a transient 409")
+	}
+}
+
+// 端末が鳴っていた（180）のに応答しなかった場合は、到達不能ではなく呼出時間切れ
+func TestRingingDeviceNoAnswerIsTimeout(t *testing.T) {
+	f := newFixture(t, 30*time.Second)
+	id := f.incoming("caller-12")
+	f.ari.contacts = "PJSIP/201/sip:201@10.0.0.5:5060;myvoip-reg=r12"
+	_, _ = f.ctrl.Ready(context.Background(), "d-1", id, "r12")
+	devCh := "myvoip-dev-" + id
+	waitFor(t, func() bool { return f.ari.has("dial " + devCh) })
+	f.ctrl.HandleEvent(ari.Event{Type: "ChannelStateChange", Channel: &ari.Channel{ID: devCh, State: "Ringing"}})
+	f.ctrl.HandleEvent(ari.Event{Type: "ChannelDestroyed", Channel: &ari.Channel{ID: devCh}, Cause: 16})
+	st := f.status(id)
+	if st.State != StateEnded || *st.EndReason != ReasonTimeout {
+		t.Fatalf("expected timeout, got %+v", st)
+	}
+	if !f.ari.has("hangup caller-12 no_answer") {
+		t.Fatalf("caller should get no_answer, ops=%v", f.ari.ops)
 	}
 }
 

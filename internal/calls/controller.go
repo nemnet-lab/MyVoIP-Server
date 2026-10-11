@@ -89,6 +89,8 @@ type Options struct {
 	TestPromptLimit time.Duration
 	// DialExtensionNumber は端末レッグの発呼先を内線番号のエンドポイントにする（中継モード）
 	DialExtensionNumber bool
+	// DeviceStasisWait は作成した端末レッグが Stasis に入るのを待つ上限
+	DeviceStasisWait time.Duration
 }
 
 // dialEndpoint は端末レッグを発呼する PJSIP エンドポイント名。
@@ -110,6 +112,8 @@ type Controller struct {
 	calls     map[string]*active
 	byChannel map[string]string
 	subs      map[string]map[chan Status]struct{}
+	// deviceInStasis は作成した端末レッグが Stasis に入ったことを dialDevice に知らせる
+	deviceInStasis map[string]chan struct{}
 
 	// contacts は ContactStatusChange イベントで知った PJSIP の登録先（エンドポイント名 → Contact URI の集合）
 	contactsMu sync.Mutex
@@ -204,12 +208,17 @@ func New(st store.Store, a ARI, p Pusher, log *slog.Logger, opts Options) *Contr
 	if opts.TestPromptLimit == 0 {
 		opts.TestPromptLimit = 15 * time.Second
 	}
+	if opts.DeviceStasisWait == 0 {
+		opts.DeviceStasisWait = 2 * time.Second
+	}
 	return &Controller{
 		store: st, ari: a, push: p, log: log, opts: opts,
 		calls:     map[string]*active{},
 		byChannel: map[string]string{},
 		subs:      map[string]map[chan Status]struct{}{},
 		contacts:  map[string]map[string]struct{}{},
+
+		deviceInStasis: map[string]chan struct{}{},
 
 		seenEvents:  map[string]time.Time{},
 		seenCallers: map[string]time.Time{},
@@ -577,6 +586,13 @@ func (c *Controller) dialDevice(callID string) {
 	channelID := "myvoip-dev-" + callID
 	a.call.DeviceChannel = channelID
 	c.byChannel[channelID] = callID
+	inStasis := make(chan struct{})
+	c.deviceInStasis[channelID] = inStasis
+	defer func() {
+		c.mu.Lock()
+		delete(c.deviceInStasis, channelID)
+		c.mu.Unlock()
+	}()
 	_ = c.store.SaveCall(ctx, a.call)
 	remaining := int(time.Until(a.call.ExpiresAt).Seconds())
 	if remaining < 1 {
@@ -587,8 +603,15 @@ func (c *Controller) dialDevice(callID string) {
 
 	err := c.ari.CreateChannel(ctx, dialTarget, "device,"+callID, channelID)
 	if err == nil {
+		// /channels/create から戻った時点では、まだ Stasis に入りきっていないことがある（その間の操作は 409）。
+		// StasisStart を待ってから変数を設定する
+		select {
+		case <-inStasis:
+		case <-time.After(c.opts.DeviceStasisWait):
+			log.Warn("device leg StasisStart not seen yet; continuing")
+		}
 		// 相関ヘッダーで Push と同じ呼に結び付ける。外部由来の同名ヘッダーは新しいチャネルに引き継がれない
-		err = c.ari.SetVariable(ctx, channelID, "PJSIP_HEADER(add,X-MyVoIP-Call-ID)", callID)
+		err = c.setVariableRetry(ctx, channelID, "PJSIP_HEADER(add,X-MyVoIP-Call-ID)", callID)
 	}
 	if err == nil {
 		_ = c.ari.SetVariable(ctx, channelID, "CALLERID(num)", call.CallerNumber)
@@ -609,6 +632,22 @@ func (c *Controller) dialDevice(callID string) {
 		return
 	}
 	log.Info("device leg dialing")
+}
+
+// setVariableRetry は「Channel not in Stasis application」（409）のときだけ、短い間隔でやり直す。
+func (c *Controller) setVariableRetry(ctx context.Context, channelID, name, value string) error {
+	var err error
+	for attempt := 0; attempt < 10; attempt++ {
+		if err = c.ari.SetVariable(ctx, channelID, name, value); err == nil || !strings.Contains(err.Error(), ": 409 ") {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	return err
 }
 
 // currentContact は PJSIP_DIAL_CONTACTS の結果（"PJSIP/201/sip:...&PJSIP/201/sip:..."）から、
@@ -646,6 +685,10 @@ func (c *Controller) onDeviceInStasis(callID, channelID string) {
 	c.mu.Lock()
 	a := c.calls[callID]
 	alive := a != nil && a.call.State != StateEnded && a.call.DeviceChannel == channelID
+	if ch, ok := c.deviceInStasis[channelID]; ok {
+		close(ch)
+		delete(c.deviceInStasis, channelID)
+	}
 	c.mu.Unlock()
 	if !alive {
 		ctx, cancel := ctxTimeout()
@@ -758,6 +801,9 @@ func (c *Controller) onChannelGone(channelID string, cause int, destroyed bool) 
 		} else if cause == 17 || cause == 21 {
 			// 486 Busy / 603 Decline
 			reason = ReasonDeclined
+		} else if a.call.State == StateRinging || cause == 18 || cause == 19 {
+			// 端末は鳴っていた（180 を返した）が応答しなかった。到達できなかったのではなく呼出時間切れ
+			reason = ReasonTimeout
 		} else {
 			reason = ReasonDeviceUnreachable
 		}
