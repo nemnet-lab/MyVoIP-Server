@@ -32,8 +32,9 @@ func (nopARI) AddToBridge(context.Context, string, ...string) error          { r
 func (nopARI) DestroyBridge(context.Context, string) error                   { return nil }
 func (nopARI) GetChannelVar(context.Context, string, string) (string, error) { return "", nil }
 func (nopARI) EndpointState(context.Context, string, string) (string, error) { return "offline", nil }
-func (nopARI) PlayOnBridge(context.Context, string, string, string) error    { return nil }
-func (nopARI) RecordBridge(context.Context, string, string, int) error       { return nil }
+func (nopARI) Play(context.Context, string, string, string) error            { return nil }
+func (nopARI) RemoveFromBridge(context.Context, string, ...string) error     { return nil }
+func (nopARI) Record(context.Context, string, string, int) error             { return nil }
 func (nopARI) DeleteStoredRecording(context.Context, string) error           { return nil }
 
 type nopPusher struct{}

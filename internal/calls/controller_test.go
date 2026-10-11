@@ -94,12 +94,16 @@ func (f *fakeARI) EndpointState(_ context.Context, tech, resource string) (strin
 	}
 	return f.state, nil
 }
-func (f *fakeARI) PlayOnBridge(_ context.Context, bridge, media, id string) error {
-	f.record("play " + bridge + " " + media + " " + id)
+func (f *fakeARI) RemoveFromBridge(_ context.Context, id string, chs ...string) error {
+	f.record("remove " + id + " " + strings.Join(chs, ","))
 	return nil
 }
-func (f *fakeARI) RecordBridge(_ context.Context, bridge, name string, max int) error {
-	f.record("record " + bridge + " " + name)
+func (f *fakeARI) Play(_ context.Context, ch, media, id string) error {
+	f.record("play " + ch + " " + media + " " + id)
+	return nil
+}
+func (f *fakeARI) Record(_ context.Context, ch, name string, max int) error {
+	f.record("record " + ch + " " + name)
 	if f.failRecord {
 		return fmt.Errorf("Unrecognized recording error: No such file or directory")
 	}
@@ -434,7 +438,7 @@ func TestTestCallProceedsWhenPromptNeverFinishes(t *testing.T) {
 	devCh := "myvoip-dev-" + id
 	waitFor(t, func() bool { return f.ari.has("dial " + devCh) })
 	f.ctrl.HandleEvent(ari.Event{Type: "ChannelStateChange", Channel: &ari.Channel{ID: devCh, State: "Up"}})
-	waitFor(t, func() bool { return f.ari.has("record myvoip-br-" + id) })
+	waitFor(t, func() bool { return f.ari.has("record " + devCh) })
 	// 遅れて届いた終了通知で二重に録音しない
 	f.ctrl.HandleEvent(ari.Event{Type: "PlaybackFinished", Playback: &ari.Playback{ID: testPlaybackID(id, 1), State: "failed"}})
 	f.ari.mu.Lock()
@@ -549,16 +553,17 @@ func TestTestCallPlaysRecordsAndEnds(t *testing.T) {
 		t.Fatalf("test call must target the contact from the event, ops=%v", f.ari.ops)
 	}
 	f.ctrl.HandleEvent(ari.Event{Type: "ChannelStateChange", Channel: &ari.Channel{ID: devCh, State: "Up"}})
-	br := "myvoip-br-" + id
-	if !f.ari.has("add "+br+" "+devCh) || !f.ari.has("play "+br+" sound:vm-intro") {
-		t.Fatalf("prompt must be played on the test bridge, ops=%v", f.ari.ops)
+	// 保留用ブリッジから抜けさせてから、チャネルに対して再生する
+	tmp := "myvoip-tmp-" + id
+	if !f.ari.has("add "+tmp+" "+devCh) || !f.ari.has("remove "+tmp+" "+devCh) || !f.ari.has("play "+devCh+" sound:vm-intro") {
+		t.Fatalf("test leg must leave the dial bridge and play on the channel, ops=%v", f.ari.ops)
 	}
 	f.ctrl.HandleEvent(ari.Event{Type: "PlaybackFinished", Playback: &ari.Playback{ID: testPlaybackID(id, 1)}})
-	if !f.ari.has("record " + br) {
-		t.Fatal("not recording the bridge")
+	if !f.ari.has("record " + devCh) {
+		t.Fatal("not recording the channel")
 	}
 	f.ctrl.HandleEvent(ari.Event{Type: "RecordingFinished", Recording: &ari.Recording{Name: testRecordingName(id)}})
-	if !f.ari.has("play " + br + " recording:") {
+	if !f.ari.has("play " + devCh + " recording:") {
 		t.Fatal("recording not played back")
 	}
 	f.ctrl.HandleEvent(ari.Event{Type: "PlaybackFinished", Playback: &ari.Playback{ID: testPlaybackID(id, 2)}})

@@ -220,17 +220,24 @@ func (c *Client) Subscribe(ctx context.Context, eventSource string) error {
 	return c.do(ctx, http.MethodPost, "/applications/"+url.PathEscape(c.app)+"/subscription", url.Values{"eventSource": {eventSource}}, nil)
 }
 
-// PlayOnBridge はブリッジに音声を流す。
-func (c *Client) PlayOnBridge(ctx context.Context, bridgeID, media, playbackID string) error {
+// Play はチャネルに音声を流す。
+func (c *Client) Play(ctx context.Context, channelID, media, playbackID string) error {
 	q := url.Values{"media": {media}}
-	return c.do(ctx, http.MethodPost, "/bridges/"+url.PathEscape(bridgeID)+"/play/"+url.PathEscape(playbackID), q, nil)
+	return c.do(ctx, http.MethodPost, "/channels/"+url.PathEscape(channelID)+"/play/"+url.PathEscape(playbackID), q, nil)
 }
 
-// RecordBridge はブリッジの音声を録音する（ビープのあと maxSeconds 秒）。
-func (c *Client) RecordBridge(ctx context.Context, bridgeID, name string, maxSeconds int) error {
+// Record はチャネルの音声を録音する（ビープのあと maxSeconds 秒）。
+// チャネルがブリッジに入っている間は録音できない（Asterisk の制限）。
+func (c *Client) Record(ctx context.Context, channelID, name string, maxSeconds int) error {
 	q := url.Values{"name": {name}, "format": {"wav"}, "maxDurationSeconds": {fmt.Sprint(maxSeconds)},
 		"beep": {"true"}, "ifExists": {"overwrite"}, "terminateOn": {"none"}}
-	return c.do(ctx, http.MethodPost, "/bridges/"+url.PathEscape(bridgeID)+"/record", q, nil)
+	return c.do(ctx, http.MethodPost, "/channels/"+url.PathEscape(channelID)+"/record", q, nil)
+}
+
+// RemoveFromBridge はブリッジからチャネルを外す。
+func (c *Client) RemoveFromBridge(ctx context.Context, bridgeID string, channels ...string) error {
+	q := url.Values{"channel": {strings.Join(channels, ",")}}
+	return c.do(ctx, http.MethodPost, "/bridges/"+url.PathEscape(bridgeID)+"/removeChannel", q, nil)
 }
 
 func (c *Client) DeleteStoredRecording(ctx context.Context, name string) error {
