@@ -50,9 +50,9 @@ iPhone（LAN / VPN）──HTTP(S)──▶ Caddy または Nginx ─▶ myvoip�
 git clone https://github.com/nemnet-lab/MyVoIP-Server.git
 cd MyVoIP-Server
 cp .env.example .env
+mkdir -p secrets            # 先に作る（compose に作らせると root の持ち物になる）
 docker compose run --rm --no-deps myvoip gen-secret   # 出力を .env の MYVOIP_SECRET_KEY に貼る
 vi .env                   # プロキシ・アドレス・ARI・SIP・APNs の値を記入
-mkdir -p secrets
 cp ~/AuthKey_XXXXXXXXXX.p8 secrets/apns.p8
 chmod 644 secrets/apns.p8   # コンテナ内の非 root ユーザーが読めるようにする
 docker compose up -d --build
@@ -86,6 +86,22 @@ ARI と内線の確認：
 docker compose exec myvoip myvoip-server check-ari --extension 201
 ```
 
+### Tailscale（Tailnet）だけで使う構成
+
+iPhone・このサーバー・MikoPBX をすべて同じ tailnet に入れ、Tailnet のアドレス（100.64.0.0/10）だけでやり取りする構成です。社内でも外出先でも同じ設定で使えます。
+
+| 経路 | 設定 |
+|---|---|
+| iPhone → このサーバー（API） | `MYVOIP_PUBLIC_URL=http://<このサーバーの Tailnet アドレス>` |
+| iPhone → MikoPBX（SIP・RTP） | `SIP_DOMAIN=<MikoPBX の Tailnet アドレス>` |
+| このサーバー → MikoPBX（ARI） | `ARI_URL=http://<MikoPBX の Tailnet アドレス>:8088/asterisk/ari` |
+| Tailnet 以外からの API を拒否 | `MYVOIP_ALLOWED_CLIENT_CIDRS=100.64.0.0/10` |
+
+- このサーバーのホストに Tailscale を入れて tailnet に参加させます（`tailscale up`）。Docker のポートは全インターフェースで待ち受けますが、`MYVOIP_ALLOWED_CLIENT_CIDRS` で Tailnet 以外からの API 要求を拒否します。
+- iPhone に Tailscale を入れ、**VPN オンデマンド**を有効にします。着信 Push でアプリが起きたときに VPN がつながっていないと、通話できません。
+- Tailscale の ACL で、iPhone → このサーバーの HTTP（80 または 443）、iPhone → MikoPBX の SIP（5060/UDP など）と RTP の範囲、このサーバー → MikoPBX の 8088/TCP を許可します。
+- **MikoPBX 側の注意**：Tailnet のクライアントに対して、MikoPBX が SIP の Contact・Via や SDP の音声アドレス（`c=`）に **Tailnet のアドレス**を使う必要があります。LAN のアドレスを返すと、無音になったり切断できなくなったりします。Asterisk の PJSIP では、トランスポートの `local_net`（LAN のアドレス帯）と `external_signaling_address` / `external_media_address`（MikoPBX の Tailnet アドレス）で調整します。
+
 ## 4. 内線と iPhone の登録
 
 ```bash
@@ -117,6 +133,19 @@ docker compose exec myvoip myvoip-server enroll-code --extension 201
 4. 自動で終了する
 
 着信しない・音声が出ないときは [9. トラブルシューティング](#9-トラブルシューティング)へ。
+
+## MikoPBX 2024.1 での ARI の有効化
+
+MikoPBX 2024.1 の画面には ARI を有効にする項目がないため、次のように設定します（2024.1.114 で確認）。
+
+- 「システムファイルのカスタマイズ」で `modules.conf` を **script モード**にし、`res_ari` などの load 行と `ari.conf`（ユーザー `myvoip`）を生成する。設定の再生成や core reload の後も保たれる。
+- この項目を画面から保存すると **core restart になり、全通話が切れる**。変更は通話のない時間に行う。
+- ARI の URL は `http://<MikoPBX>:8088/asterisk/ari`（WebSocket は `/asterisk/ari/events`）。
+- Asterisk の ARI ユーザーはアプリケーション名ごとの制限を持たないため、`ARI_APP=myvoip` のままでよい。
+
+## Docker の既定のアドレス帯との衝突
+
+Docker は既定で `172.17.0.0/16`・`172.18.0.0/16` などをコンテナ用に使います。LAN が同じアドレス帯だと、Docker が動いているホスト（このサーバー・MikoPBX のホスト）からその LAN へ届かなくなります。LAN と重なる場合は、`/etc/docker/daemon.json` の `bip` と `default-address-pools` を、使っていないアドレス帯（例 `10.200.0.0/16`）に変えてください。変更には Docker の再起動が必要です（MikoPBX を Docker で動かしている場合は通話が切れます）。
 
 ## 6. 着信ルート（MikoPBX）
 
@@ -177,6 +206,8 @@ docker compose build myvoip         # イメージのビルド
 | 応答後に無音・片通話 | MikoPBX の RTP ポートへの到達性（VPN の経路・ファイアウォール）、MikoPBX の NAT 設定 |
 | `SIP_SRTP=mandatory` で通話できない | MikoPBX 側で SRTP が有効か。不要なら `optional` にする |
 | アプリで登録時に通信できない | iPhone から `MYVOIP_PUBLIC_URL` に届くか（LAN・VPN の接続）。初回は iPhone の「ローカルネットワーク」許可を求められるので許可する |
+| API が 403 `client_not_allowed` | `MYVOIP_ALLOWED_CLIENT_CIDRS` の範囲外から接続している（ログの `client` を確認）。Tailnet 経由で接続しているか |
+| ARI に接続できない（404） | MikoPBX 2024.1 は `ARI_URL` に接頭辞 `/asterisk` が必要 |
 | アプリで「登録コードが無効」 | 10分の期限切れ・使用済み。コードを再発行する |
 
 ## ライセンス

@@ -141,6 +141,7 @@ func serve(log *slog.Logger) error {
 		AccessTokenTTL:  cfg.AccessTokenTTL,
 		RefreshTokenTTL: cfg.RefreshTokenTTL,
 		RingTimeout:     cfg.RingTimeout,
+		AllowedClients:  cfg.AllowedClients,
 	}, log)
 	httpServer := &http.Server{
 		Addr:              cfg.Listen,
@@ -154,7 +155,8 @@ func serve(log *slog.Logger) error {
 		_ = httpServer.Shutdown(shutdownCtx)
 	}()
 	log.Info("myvoip-server listening", "addr", cfg.Listen, "public_url", cfg.PublicURL, "ari_app", cfg.ARIApp,
-		"sip_transport", cfg.SIPTransport, "sip_port", cfg.SIPProxyPort, "srtp", cfg.SIPSRTP)
+		"sip_transport", cfg.SIPTransport, "sip_port", cfg.SIPProxyPort, "srtp", cfg.SIPSRTP,
+		"allowed_clients", fmt.Sprint(cfg.AllowedClients))
 	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}

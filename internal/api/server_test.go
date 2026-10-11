@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -232,6 +233,38 @@ func TestCallStatusNotVisibleToOtherDevice(t *testing.T) {
 	resp, _ := e.do("GET", "/v1/calls/00000000-0000-4000-8000-000000000000", token, nil)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatal("unknown call should be 404")
+	}
+}
+
+func TestAllowedClientsRestrictAccess(t *testing.T) {
+	st := store.NewMemory()
+	box, _ := secret.NewBox("MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctrl := calls.New(st, nopARI{}, nopPusher{}, logger, calls.Options{})
+	s := New(st, ctrl, box, Config{AllowedClients: []netip.Prefix{netip.MustParsePrefix("100.64.0.0/10")}}, logger)
+	handler := s.Handler()
+	check := func(remote, xff string) int {
+		req := httptest.NewRequest("GET", "/v1/device/status", nil)
+		req.RemoteAddr = remote
+		if xff != "" {
+			req.Header.Set("X-Forwarded-For", xff)
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if got := check("172.20.0.3:5000", "100.101.2.3"); got != http.StatusUnauthorized {
+		t.Fatalf("tailnet client should reach auth, got %d", got)
+	}
+	if got := check("172.20.0.3:5000", "192.168.1.5"); got != http.StatusForbidden {
+		t.Fatalf("LAN client should be forbidden, got %d", got)
+	}
+	// 偽の X-Forwarded-For を付けても、プロキシが末尾に付けた実際のアドレスで判定する
+	if got := check("172.20.0.3:5000", "100.101.2.3, 192.168.1.5"); got != http.StatusForbidden {
+		t.Fatalf("spoofed header should be forbidden, got %d", got)
+	}
+	if got := check("127.0.0.1:5000", ""); got != http.StatusUnauthorized {
+		t.Fatalf("loopback (healthcheck) should be allowed, got %d", got)
 	}
 }
 

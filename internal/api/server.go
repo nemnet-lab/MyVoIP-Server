@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +31,9 @@ type Config struct {
 	AccessTokenTTL  time.Duration
 	RefreshTokenTTL time.Duration
 	RingTimeout     time.Duration
+	// AllowedClients は API に接続できるクライアントのアドレス帯。空なら制限しない
+	//（例: Tailnet だけに絞るなら 100.64.0.0/10）。ループバックは常に許可する
+	AllowedClients []netip.Prefix
 }
 
 type Server struct {
@@ -63,7 +67,32 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/history", s.auth(s.history))
 	mux.HandleFunc("DELETE /v1/history/{id}", s.auth(s.deleteHistory))
 	mux.HandleFunc("DELETE /v1/history", s.auth(s.deleteAllHistory))
-	return s.logRequests(mux)
+	return s.logRequests(s.restrictClients(mux))
+}
+
+// restrictClients は許可したアドレス帯以外からの要求を拒否する。
+func (s *Server) restrictClients(next http.Handler) http.Handler {
+	if len(s.cfg.AllowedClients) == 0 {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		addr, err := netip.ParseAddr(clientIP(r))
+		if err == nil {
+			addr = addr.Unmap()
+			if addr.IsLoopback() {
+				next.ServeHTTP(w, r)
+				return
+			}
+			for _, prefix := range s.cfg.AllowedClients {
+				if prefix.Contains(addr) {
+					next.ServeHTTP(w, r)
+					return
+				}
+			}
+		}
+		s.log.Warn("client address not allowed", "client", clientIP(r), "path", r.URL.Path)
+		writeError(w, http.StatusForbidden, "client_not_allowed")
+	})
 }
 
 // --- 共通
@@ -85,9 +114,11 @@ func readJSON(r *http.Request, v any) error {
 }
 
 func clientIP(r *http.Request) string {
-	// Caddy の背後で動かすため X-Forwarded-For の先頭を使う
+	// リバースプロキシ（Caddy・Nginx）の背後で動かすため、プロキシが付けた X-Forwarded-For の末尾を使う。
+	// サービスのポートは外部に公開せず、プロキシ経由でしか届かない
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		return strings.TrimSpace(strings.Split(xff, ",")[0])
+		parts := strings.Split(xff, ",")
+		return strings.TrimSpace(parts[len(parts)-1])
 	}
 	host, _, _ := net.SplitHostPort(r.RemoteAddr)
 	return host

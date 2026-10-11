@@ -28,6 +28,19 @@ func TestTLSDefaultPort(t *testing.T) {
 	}
 }
 
+func TestAllowedClientCIDRs(t *testing.T) {
+	base(t)
+	t.Setenv("MYVOIP_ALLOWED_CLIENT_CIDRS", "100.64.0.0/10, fd7a:115c:a1e0::/48")
+	c, err := Load(false)
+	if err != nil || len(c.AllowedClients) != 2 {
+		t.Fatalf("%v %v", err, c.AllowedClients)
+	}
+	t.Setenv("MYVOIP_ALLOWED_CLIENT_CIDRS", "100.64.0.0")
+	if _, err := Load(false); err == nil {
+		t.Fatal("invalid CIDR accepted")
+	}
+}
+
 func TestRejectsUnknownValues(t *testing.T) {
 	base(t)
 	t.Setenv("SIP_TRANSPORT", "sctp")

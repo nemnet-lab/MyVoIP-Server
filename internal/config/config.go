@@ -4,6 +4,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
@@ -43,6 +44,8 @@ type Config struct {
 	HistoryRetention  time.Duration
 
 	TestCallSound string
+	// AllowedClients は API に接続できるクライアントのアドレス帯（MYVOIP_ALLOWED_CLIENT_CIDRS）
+	AllowedClients []netip.Prefix
 }
 
 func env(key, def string) string {
@@ -114,6 +117,18 @@ func Load(requireRuntime bool) (Config, error) {
 		c.SIPProxyPort = envInt("SIP_PROXY_PORT", 5061)
 	default:
 		errs = append(errs, "SIP_TRANSPORT must be udp, tcp or tls")
+	}
+	for _, raw := range strings.Split(env("MYVOIP_ALLOWED_CLIENT_CIDRS", ""), ",") {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		prefix, err := netip.ParsePrefix(raw)
+		if err != nil {
+			errs = append(errs, "MYVOIP_ALLOWED_CLIENT_CIDRS has an invalid CIDR: "+raw)
+			continue
+		}
+		c.AllowedClients = append(c.AllowedClients, prefix.Masked())
 	}
 	switch c.SIPSRTP {
 	case "optional", "mandatory", "disabled":
