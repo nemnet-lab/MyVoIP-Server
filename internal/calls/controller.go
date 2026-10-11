@@ -114,6 +114,69 @@ type Controller struct {
 	// contacts は ContactStatusChange イベントで知った PJSIP の登録先（エンドポイント名 → Contact URI の集合）
 	contactsMu sync.Mutex
 	contacts   map[string]map[string]struct{}
+
+	// 同じイベントが複数の購読（アプリとエンドポイント）から届くことがあるため、重複を捨てる
+	seenMu     sync.Mutex
+	seenEvents map[string]time.Time
+	// 一度受け付けた発信側チャネル（同じチャネルで呼を二重に作らない）
+	seenCallers map[string]time.Time
+}
+
+const seenTTL = 10 * time.Minute
+
+// duplicateEvent は同じ内容のイベントを一度だけ通す。
+func (c *Controller) duplicateEvent(ev ari.Event) bool {
+	if ev.Timestamp == "" {
+		return false
+	}
+	key := ev.Type + "|" + ev.Timestamp
+	if ev.Channel != nil {
+		key += "|" + ev.Channel.ID + "|" + ev.Channel.State
+	}
+	if ev.Peer != nil {
+		key += "|" + ev.Peer.ID + "|" + ev.DialStatus
+	}
+	if ev.Playback != nil {
+		key += "|" + ev.Playback.ID + "|" + ev.Playback.State
+	}
+	if ev.Recording != nil {
+		key += "|" + ev.Recording.Name + "|" + ev.Recording.State
+	}
+	if ev.ContactInfo != nil {
+		key += "|" + ev.ContactInfo.URI + "|" + ev.ContactInfo.ContactStatus
+	}
+	now := time.Now()
+	c.seenMu.Lock()
+	defer c.seenMu.Unlock()
+	if len(c.seenEvents) > 2000 {
+		for k, t := range c.seenEvents {
+			if now.Sub(t) > time.Minute {
+				delete(c.seenEvents, k)
+			}
+		}
+	}
+	if _, ok := c.seenEvents[key]; ok {
+		return true
+	}
+	c.seenEvents[key] = now
+	return false
+}
+
+// firstTimeCaller は発信側チャネルを初めて受け付けるときだけ true を返す。
+func (c *Controller) firstTimeCaller(channelID string) bool {
+	now := time.Now()
+	c.seenMu.Lock()
+	defer c.seenMu.Unlock()
+	for id, t := range c.seenCallers {
+		if now.Sub(t) > seenTTL {
+			delete(c.seenCallers, id)
+		}
+	}
+	if _, ok := c.seenCallers[channelID]; ok {
+		return false
+	}
+	c.seenCallers[channelID] = now
+	return true
 }
 
 type active struct {
@@ -147,6 +210,9 @@ func New(st store.Store, a ARI, p Pusher, log *slog.Logger, opts Options) *Contr
 		byChannel: map[string]string{},
 		subs:      map[string]map[chan Status]struct{}{},
 		contacts:  map[string]map[string]struct{}{},
+
+		seenEvents:  map[string]time.Time{},
+		seenCallers: map[string]time.Time{},
 	}
 }
 
@@ -207,6 +273,9 @@ func run(effects []func()) {
 // --- ARI イベント
 
 func (c *Controller) HandleEvent(ev ari.Event) {
+	if c.duplicateEvent(ev) {
+		return
+	}
 	switch ev.Type {
 	case "StasisStart":
 		if ev.Channel == nil {
@@ -220,6 +289,10 @@ func (c *Controller) HandleEvent(ev ari.Event) {
 		ext := ev.Channel.Dialplan.Exten
 		if len(ev.Args) >= 1 && ev.Args[0] != "" {
 			ext = ev.Args[0]
+		}
+		if !c.firstTimeCaller(ev.Channel.ID) {
+			c.log.Warn("duplicate StasisStart for caller ignored", "caller_channel", ev.Channel.ID)
+			return
 		}
 		c.onIncoming(*ev.Channel, ext)
 	case "StasisEnd", "ChannelDestroyed":

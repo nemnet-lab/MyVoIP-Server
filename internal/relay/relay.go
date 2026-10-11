@@ -66,6 +66,7 @@ func NewPassword() string {
 }
 
 // Render は内線一覧から pjsip の設定を作る。
+// コーデックは MikoPBX の既定（PCMA 優先）に合わせて alaw,ulaw の順にし、両側で同じコーデックになるようにする。
 func Render(exts []store.Extension, box *secret.Box, opts Options) (string, error) {
 	sort.Slice(exts, func(i, j int) bool { return exts[i].Number < exts[j].Number })
 	var b strings.Builder
@@ -95,7 +96,7 @@ func Render(exts []store.Extension, box *secret.Box, opts Options) (string, erro
 		fmt.Fprintf(&b, "\n; ===== 内線 %s：MikoPBX への登録（MikoPBX から見た内線 %s） =====\n", e.Number, e.SIPUsername)
 		fmt.Fprintf(&b, "[%s-auth]\ntype=auth\nauth_type=userpass\nusername=%s\npassword=%s\n\n", up, authUser, escape(upstreamPassword))
 		fmt.Fprintf(&b, "[%s]\ntype=aor\ncontact=%s\n\n", up, server)
-		fmt.Fprintf(&b, "[%s]\ntype=endpoint\ntransport=transport-udp\ncontext=from-pbx\ndisallow=all\nallow=ulaw,alaw\n"+
+		fmt.Fprintf(&b, "[%s]\ntype=endpoint\ntransport=transport-udp\ncontext=from-pbx\ndisallow=all\nallow=alaw,ulaw\n"+
 			"outbound_auth=%s-auth\naors=%s\nfrom_user=%s\nfrom_domain=%s\ndirect_media=no\nrtp_symmetric=yes\n"+
 			"force_rport=yes\nrewrite_contact=yes\ndtmf_mode=rfc4733\nset_var=MYVOIP_EXT=%s\n\n",
 			up, up, up, e.SIPUsername, opts.UpstreamHost, e.Number)
@@ -112,7 +113,7 @@ func Render(exts []store.Extension, box *secret.Box, opts Options) (string, erro
 		if opts.SRTP == "mandatory" {
 			encryption = "sdes"
 		}
-		fmt.Fprintf(&b, "[%s]\ntype=endpoint\ntransport=transport-udp\ncontext=from-mobile\ndisallow=all\nallow=ulaw,alaw\n"+
+		fmt.Fprintf(&b, "[%s]\ntype=endpoint\ntransport=transport-udp\ncontext=from-mobile\ndisallow=all\nallow=alaw,ulaw\n"+
 			"auth=%s\naors=%s\ndirect_media=no\nrtp_symmetric=yes\nforce_rport=yes\nrewrite_contact=yes\n"+
 			"dtmf_mode=rfc4733\nmedia_encryption=%s\nset_var=MYVOIP_EXT=%s\n",
 			e.Number, e.Number, e.Number, encryption, e.Number)

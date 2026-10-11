@@ -69,6 +69,7 @@ type ContactInfo struct {
 // Event は必要なフィールドだけを持つ ARI イベント。
 type Event struct {
 	Type        string        `json:"type"`
+	Timestamp   string        `json:"timestamp"`
 	Application string        `json:"application"`
 	Args        []string      `json:"args"`
 	Channel     *Channel      `json:"channel"`

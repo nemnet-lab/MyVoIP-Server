@@ -478,6 +478,26 @@ func TestTestCallRecordingFailedEventEndsGracefully(t *testing.T) {
 	}
 }
 
+// 同じイベントが複数の購読から届いても、呼を二重に作らない
+func TestDuplicateEventsAreIgnored(t *testing.T) {
+	f := newFixture(t, 30*time.Second)
+	ev := ari.Event{Type: "StasisStart", Timestamp: "2026-10-11T20:55:08.110+0900", Args: []string{"201"},
+		Channel: &ari.Channel{ID: "caller-dup", Caller: ari.Caller{Number: "1001"}}}
+	f.ctrl.HandleEvent(ev)
+	<-f.push.sent
+	f.ctrl.HandleEvent(ev) // 同じ内容
+	// 時刻が違っても、同じ発信側チャネルの StasisStart は受け付けない
+	ev.Timestamp = "2026-10-11T20:55:55.081+0900"
+	f.ctrl.HandleEvent(ev)
+	time.Sleep(200 * time.Millisecond)
+	f.push.mu.Lock()
+	pushes := len(f.push.voip)
+	f.push.mu.Unlock()
+	if pushes != 1 {
+		t.Fatalf("pushed %d times", pushes)
+	}
+}
+
 func TestDeclineAndBusy(t *testing.T) {
 	f := newFixture(t, 30*time.Second)
 	id := f.incoming("caller-6")
