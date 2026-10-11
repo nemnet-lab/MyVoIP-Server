@@ -86,6 +86,8 @@ ARI と内線の確認：
 docker compose exec myvoip myvoip-server check-ari --extension 201
 ```
 
+`online`（到達可能な登録あり）か `offline`（登録なし。アプリ休止中は正常）が表示されます。エンドポイント名が違うとエラーになります。
+
 ### Tailscale（Tailnet）だけで使う構成
 
 iPhone・このサーバー・MikoPBX をすべて同じ tailnet に入れ、Tailnet のアドレス（100.64.0.0/10）だけでやり取りする構成です。社内でも外出先でも同じ設定で使えます。
@@ -172,7 +174,7 @@ Stasis(myvoip,201)
 
 ### 内線の登録数の設定
 
-アプリは SIP 接続を張り直すたびに新しい Contact（接続世代 `myvoip-reg=…` 付き）で登録します。サーバーは ready のときに今回の Contact を確かめ、その Contact だけを直接呼ぶ（`PJSIP/<内線>/sip:…`）ため、古い Contact が残っていても誤った宛先には発呼しません。それでも、MyVoIP 専用の内線は `max_contacts=1`・`remove_existing=yes` にしておくと、MikoPBX 側の Contact の一覧が分かりやすくなります。
+アプリは SIP 接続を張り直すたびに新しい Contact（接続世代 `myvoip-reg=…` 付き）で登録します。サーバーは ARI で PJSIP エンドポイントのイベント（`ContactStatusChange`）を購読して登録先を把握し、ready のときに今回の Contact だけを直接呼ぶ（`PJSIP/<内線>/sip:…`）ため、古い Contact が残っていても誤った宛先には発呼しません。実際の着信では、発信側のチャネル上で `PJSIP_DIAL_CONTACTS` も評価します（ARI のグローバル変数の取得は関数を評価しないため、チャネル経由で読む）。それでも、MyVoIP 専用の内線は `max_contacts=1`・`remove_existing=yes` にしておくと、MikoPBX 側の Contact の一覧が分かりやすくなります。
 
 ## 7. 運用
 
@@ -215,7 +217,7 @@ docker compose build myvoip         # イメージのビルド
 | ログに `ARI events disconnected` | `ARI_URL`・ユーザー・パスワード、MikoPBX の ARI 設定、LAN の到達性 |
 | `voip push failed ... InvalidProviderToken` | `APNS_KEY_ID`・`APNS_TEAM_ID`・`secrets/apns.p8` の組み合わせ |
 | `voip push failed ... BadDeviceToken` | アプリの APNs 環境とキーの環境の不一致（TestFlight は本番） |
-| `registered contact not found` | iPhone が MikoPBX に登録できていない。iPhone が LAN・VPN につながっているか、`SIP_DOMAIN`・`SIP_TRANSPORT`・ポート、内線の SIP パスワード |
+| `registered contact not found` | iPhone が MikoPBX に登録できていない。iPhone が LAN・VPN につながっているか、`SIP_DOMAIN`・`SIP_TRANSPORT`・ポート、内線の SIP パスワード。登録はできているのに出る場合は、ログに `ARI subscribed source=endpoint:PJSIP` と `contact status` が出ているか |
 | 応答後に無音・片通話 | MikoPBX の RTP ポートへの到達性（VPN の経路・ファイアウォール）、MikoPBX の NAT 設定 |
 | `SIP_SRTP=mandatory` で通話できない | MikoPBX 側で SRTP が有効か。不要なら `optional` にする |
 | アプリで登録時に通信できない | iPhone から `MYVOIP_PUBLIC_URL` に届くか（LAN・VPN の接続）。初回は iPhone の「ローカルネットワーク」許可を求められるので許可する |

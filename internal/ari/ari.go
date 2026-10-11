@@ -47,18 +47,33 @@ type Recording struct {
 	TargetURI string `json:"target_uri"`
 }
 
+type EndpointInfo struct {
+	Technology string `json:"technology"`
+	Resource   string `json:"resource"`
+	State      string `json:"state"`
+}
+
+// ContactInfo は ContactStatusChange イベントの Contact（PJSIP の登録先）。
+type ContactInfo struct {
+	URI           string `json:"uri"`
+	ContactStatus string `json:"contact_status"`
+	AOR           string `json:"aor"`
+}
+
 // Event は必要なフィールドだけを持つ ARI イベント。
 type Event struct {
-	Type        string     `json:"type"`
-	Application string     `json:"application"`
-	Args        []string   `json:"args"`
-	Channel     *Channel   `json:"channel"`
-	Peer        *Channel   `json:"peer"`
-	Cause       int        `json:"cause"`
-	CauseTxt    string     `json:"cause_txt"`
-	DialStatus  string     `json:"dialstatus"`
-	Playback    *Playback  `json:"playback"`
-	Recording   *Recording `json:"recording"`
+	Type        string        `json:"type"`
+	Application string        `json:"application"`
+	Args        []string      `json:"args"`
+	Channel     *Channel      `json:"channel"`
+	Peer        *Channel      `json:"peer"`
+	Cause       int           `json:"cause"`
+	CauseTxt    string        `json:"cause_txt"`
+	DialStatus  string        `json:"dialstatus"`
+	Playback    *Playback     `json:"playback"`
+	Recording   *Recording    `json:"recording"`
+	Endpoint    *EndpointInfo `json:"endpoint"`
+	ContactInfo *ContactInfo  `json:"contact_info"`
 }
 
 type Client struct {
@@ -68,6 +83,13 @@ type Client struct {
 	app      string
 	http     *http.Client
 	log      *slog.Logger
+	// subscriptions は WebSocket の接続（再接続）ごとに購読するイベントソース
+	subscriptions []string
+}
+
+// SubscribeOnConnect は接続のたびに購読するイベントソースを設定する（例 "endpoint:PJSIP"）。
+func (c *Client) SubscribeOnConnect(sources ...string) {
+	c.subscriptions = append(c.subscriptions, sources...)
 }
 
 func New(baseURL, user, password, app string, log *slog.Logger) *Client {
@@ -170,13 +192,26 @@ func (c *Client) DestroyBridge(ctx context.Context, bridgeID string) error {
 	return err
 }
 
-// GetGlobal は関数を含むグローバル変数を評価する（例 PJSIP_DIAL_CONTACTS(201)）。
-func (c *Client) GetGlobal(ctx context.Context, expr string) (string, error) {
+// GetChannelVar はチャネル上で変数・関数を評価する（例 PJSIP_DIAL_CONTACTS(201)）。
+// グローバル変数の取得（/asterisk/variable）は関数を評価しないため、関数はチャネル経由で読む。
+func (c *Client) GetChannelVar(ctx context.Context, channelID, name string) (string, error) {
 	var out struct {
 		Value string `json:"value"`
 	}
-	err := c.do(ctx, http.MethodGet, "/asterisk/variable", url.Values{"variable": {expr}}, &out)
+	err := c.do(ctx, http.MethodGet, "/channels/"+url.PathEscape(channelID)+"/variable", url.Values{"variable": {name}}, &out)
 	return out.Value, err
+}
+
+// EndpointState はエンドポイントの状態（online / offline / unknown）。
+func (c *Client) EndpointState(ctx context.Context, tech, resource string) (string, error) {
+	var out EndpointInfo
+	err := c.do(ctx, http.MethodGet, "/endpoints/"+url.PathEscape(tech)+"/"+url.PathEscape(resource), nil, &out)
+	return out.State, err
+}
+
+// Subscribe はアプリケーションにイベントソースを購読させる。
+func (c *Client) Subscribe(ctx context.Context, eventSource string) error {
+	return c.do(ctx, http.MethodPost, "/applications/"+url.PathEscape(c.app)+"/subscription", url.Values{"eventSource": {eventSource}}, nil)
 }
 
 func (c *Client) Play(ctx context.Context, channelID, media, playbackID string) error {
@@ -249,6 +284,17 @@ func (c *Client) listen(ctx context.Context, handle func(Event)) error {
 	defer conn.CloseNow()
 	conn.SetReadLimit(1 << 20)
 	c.log.Info("ARI events connected", "app", c.app)
+
+	// アプリは WebSocket の接続で作られるため、購読は接続のたびにやり直す
+	for _, source := range c.subscriptions {
+		subCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		if err := c.Subscribe(subCtx, source); err != nil {
+			c.log.Warn("ARI subscription failed", "source", source, "error", err)
+		} else {
+			c.log.Info("ARI subscribed", "source", source)
+		}
+		cancel()
+	}
 
 	for {
 		_, data, err := conn.Read(ctx)

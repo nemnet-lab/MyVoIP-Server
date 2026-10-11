@@ -56,7 +56,8 @@ type ARI interface {
 	CreateBridge(ctx context.Context, bridgeID string) error
 	AddToBridge(ctx context.Context, bridgeID string, channels ...string) error
 	DestroyBridge(ctx context.Context, bridgeID string) error
-	GetGlobal(ctx context.Context, expr string) (string, error)
+	GetChannelVar(ctx context.Context, channelID, name string) (string, error)
+	EndpointState(ctx context.Context, tech, resource string) (string, error)
 	Play(ctx context.Context, channelID, media, playbackID string) error
 	Record(ctx context.Context, channelID, name string, maxSeconds int) error
 	DeleteStoredRecording(ctx context.Context, name string) error
@@ -96,6 +97,10 @@ type Controller struct {
 	calls     map[string]*active
 	byChannel map[string]string
 	subs      map[string]map[chan Status]struct{}
+
+	// contacts は ContactStatusChange イベントで知った PJSIP の登録先（エンドポイント名 → Contact URI の集合）
+	contactsMu sync.Mutex
+	contacts   map[string]map[string]struct{}
 }
 
 type active struct {
@@ -123,7 +128,51 @@ func New(st store.Store, a ARI, p Pusher, log *slog.Logger, opts Options) *Contr
 		calls:     map[string]*active{},
 		byChannel: map[string]string{},
 		subs:      map[string]map[chan Status]struct{}{},
+		contacts:  map[string]map[string]struct{}{},
 	}
+}
+
+// onContactStatus は PJSIP の登録先の追加・削除を記録する（ARI の ContactStatusChange）。
+func (c *Controller) onContactStatus(endpoint *ari.EndpointInfo, info *ari.ContactInfo) {
+	if info == nil || info.URI == "" {
+		return
+	}
+	name := info.AOR
+	if endpoint != nil && endpoint.Resource != "" {
+		name = endpoint.Resource
+	}
+	if name == "" {
+		return
+	}
+	c.contactsMu.Lock()
+	defer c.contactsMu.Unlock()
+	switch info.ContactStatus {
+	case "Removed", "Unreachable":
+		delete(c.contacts[name], info.URI)
+	default:
+		if c.contacts[name] == nil {
+			c.contacts[name] = map[string]struct{}{}
+		}
+		c.contacts[name][info.URI] = struct{}{}
+	}
+	if strings.Contains(info.URI, "myvoip-reg=") {
+		c.log.Info("contact status", "endpoint", name, "status", info.ContactStatus, "uri", info.URI)
+	}
+}
+
+// knownContact はイベントで知った登録先から、今回の接続世代の Contact への発呼先を返す。
+func (c *Controller) knownContact(endpoint, regID string) string {
+	if regID == "" {
+		return ""
+	}
+	c.contactsMu.Lock()
+	defer c.contactsMu.Unlock()
+	for uri := range c.contacts[endpoint] {
+		if strings.Contains(uri, "myvoip-reg="+regID) {
+			return "PJSIP/" + endpoint + "/" + uri
+		}
+	}
+	return ""
 }
 
 func ctxTimeout() (context.Context, context.CancelFunc) {
@@ -170,6 +219,8 @@ func (c *Controller) HandleEvent(ev ari.Event) {
 		if ev.Recording != nil {
 			c.onRecordingFinished(ev.Recording.Name)
 		}
+	case "ContactStatusChange":
+		c.onContactStatus(ev.Endpoint, ev.ContactInfo)
 	}
 }
 
@@ -364,21 +415,37 @@ func (c *Controller) dialDevice(callID string) {
 	if call.ExpiresAt.Before(deadline) {
 		deadline = call.ExpiresAt
 	}
+	// 古い Contact が残っていても（max_contacts>1・remove_existing=no）、今回の登録先だけを呼ぶ。
+	// 1) ARI の ContactStatusChange で知った登録先 2) 発信側チャネル上で PJSIP_DIAL_CONTACTS を評価
 	found := false
 	dialTarget := "PJSIP/" + endpoint
 	for {
-		contacts, err := c.ari.GetGlobal(ctx, fmt.Sprintf("PJSIP_DIAL_CONTACTS(%s)", endpoint))
-		if target := currentContact(contacts, regID); err == nil && target != "" {
-			// 古い Contact が残っていても（max_contacts>1・remove_existing=no）、今回の登録先だけを呼ぶ
-			dialTarget = target
-			found = true
+		if target := c.knownContact(endpoint, regID); target != "" {
+			dialTarget, found = target, true
 			break
 		}
+		if call.CallerChannel != "" {
+			contacts, err := c.ari.GetChannelVar(ctx, call.CallerChannel, fmt.Sprintf("PJSIP_DIAL_CONTACTS(%s)", endpoint))
+			if target := currentContact(contacts, regID); err == nil && target != "" {
+				dialTarget, found = target, true
+				break
+			}
+		}
 		if time.Now().After(deadline) {
-			log.Warn("registered contact not found", "error", err)
 			break
 		}
 		time.Sleep(250 * time.Millisecond)
+	}
+	if !found {
+		// 3) 登録先を特定できなくても、エンドポイントが online なら PJSIP/<内線> で呼ぶ
+		//（ARI の接続前から続いている登録など。古い Contact に当たる可能性がある）
+		state, err := c.ari.EndpointState(ctx, "PJSIP", endpoint)
+		if err == nil && state == "online" {
+			log.Warn("current contact not identified; dialing endpoint", "state", state)
+			found = true
+		} else {
+			log.Warn("registered contact not found", "endpoint_state", state, "error", err)
+		}
 	}
 
 	c.mu.Lock()

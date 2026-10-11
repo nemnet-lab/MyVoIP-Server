@@ -117,6 +117,8 @@ func serve(log *slog.Logger) error {
 	}
 	pusher := apns.New(key, cfg.APNSKeyID, cfg.APNSTeamID, cfg.APNSBundleID)
 	ariClient := ari.New(cfg.ARIURL, cfg.ARIUser, cfg.ARIPassword, cfg.ARIApp, log)
+	// PJSIP の登録先の変化（ContactStatusChange）を受け取り、端末への発呼先の特定に使う
+	ariClient.SubscribeOnConnect("endpoint:PJSIP")
 	controller := calls.New(db, ariClient, pusher, log, calls.Options{RingTimeout: cfg.RingTimeout, TestSound: cfg.TestCallSound})
 
 	// 再起動前の呼を整理してから待ち受ける。ARI に届かなくても DB 上は終了させる（R-05）
@@ -394,14 +396,17 @@ func checkARI(args []string) error {
 	}
 	fmt.Println("ARI に接続できました:", cfg.ARIURL)
 	if *extension != "" {
-		v, err := client.GetGlobal(ctx, fmt.Sprintf("PJSIP_DIAL_CONTACTS(%s)", *extension))
+		state, err := client.EndpointState(ctx, "PJSIP", *extension)
 		if err != nil {
-			return err
+			return fmt.Errorf("PJSIP/%s を取得できません（エンドポイント名を確認してください）: %w", *extension, err)
 		}
-		if v == "" {
-			fmt.Printf("PJSIP/%s の Contact: なし（アプリ休止中は正常）\n", *extension)
-		} else {
-			fmt.Printf("PJSIP/%s の Contact: %s\n", *extension, v)
+		switch state {
+		case "online":
+			fmt.Printf("PJSIP/%s: online（到達可能な登録あり）\n", *extension)
+		case "offline":
+			fmt.Printf("PJSIP/%s: offline（登録なし。アプリ休止中は正常）\n", *extension)
+		default:
+			fmt.Printf("PJSIP/%s: %s\n", *extension, state)
 		}
 	}
 	return nil

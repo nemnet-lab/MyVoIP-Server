@@ -19,7 +19,8 @@ import (
 type fakeARI struct {
 	mu       sync.Mutex
 	ops      []string
-	contacts string
+	contacts string // 発信側チャネル上で評価した PJSIP_DIAL_CONTACTS の値
+	state    string // エンドポイントの状態
 	failDial bool
 }
 
@@ -76,10 +77,21 @@ func (f *fakeARI) DestroyBridge(_ context.Context, id string) error {
 	f.record("destroy " + id)
 	return nil
 }
-func (f *fakeARI) GetGlobal(_ context.Context, expr string) (string, error) {
+func (f *fakeARI) GetChannelVar(_ context.Context, ch, name string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if ch == "" {
+		return "", fmt.Errorf("no channel")
+	}
 	return f.contacts, nil
+}
+func (f *fakeARI) EndpointState(_ context.Context, tech, resource string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.state == "" {
+		return "offline", nil
+	}
+	return f.state, nil
 }
 func (f *fakeARI) Play(_ context.Context, ch, media, id string) error {
 	f.record("play " + ch + " " + media + " " + id)
@@ -312,6 +324,43 @@ func TestCurrentContact(t *testing.T) {
 	}
 }
 
+func TestRemovedContactIsForgotten(t *testing.T) {
+	f := newFixture(t, 30*time.Second)
+	uri := "sip:201@100.100.56.35:50000;myvoip-reg=r9"
+	ev := func(status string) ari.Event {
+		return ari.Event{Type: "ContactStatusChange", Endpoint: &ari.EndpointInfo{Resource: "201"},
+			ContactInfo: &ari.ContactInfo{URI: uri, ContactStatus: status, AOR: "201"}}
+	}
+	f.ctrl.HandleEvent(ev("Created"))
+	if f.ctrl.knownContact("201", "r9") == "" {
+		t.Fatal("created contact should be known")
+	}
+	f.ctrl.HandleEvent(ev("Removed"))
+	if f.ctrl.knownContact("201", "r9") != "" {
+		t.Fatal("removed contact should be forgotten")
+	}
+}
+
+func TestFallsBackToEndpointWhenOnline(t *testing.T) {
+	f := newFixture(t, 30*time.Second)
+	id, _ := f.ctrl.StartTestCall(context.Background(), f.device)
+	<-f.push.sent
+	f.ari.state = "online"
+	_, _ = f.ctrl.Ready(context.Background(), "d-1", id, "unknown")
+	waitFor(t, func() bool { return f.ari.has("create PJSIP/201 device," + id) })
+}
+
+func TestTestCallFailsWhenEndpointOffline(t *testing.T) {
+	f := newFixture(t, 30*time.Second)
+	id, _ := f.ctrl.StartTestCall(context.Background(), f.device)
+	<-f.push.sent
+	_, _ = f.ctrl.Ready(context.Background(), "d-1", id, "unknown")
+	waitFor(t, func() bool { return f.status(id).State == StateEnded })
+	if *f.status(id).EndReason != ReasonDeviceUnreachable || f.ari.has("create ") {
+		t.Fatal("offline endpoint must not be dialed")
+	}
+}
+
 func TestDeclineAndBusy(t *testing.T) {
 	f := newFixture(t, 30*time.Second)
 	id := f.incoming("caller-6")
@@ -376,10 +425,16 @@ func TestTestCallPlaysRecordsAndEnds(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-f.push.sent
-	f.ari.contacts = "PJSIP/201/sip:201@10.0.0.5:5060;myvoip-reg=t1"
+	// テスト着信には発信側チャネルがないので、ContactStatusChange で知った登録先を使う
+	f.ctrl.HandleEvent(ari.Event{Type: "ContactStatusChange",
+		Endpoint:    &ari.EndpointInfo{Technology: "PJSIP", Resource: "201", State: "online"},
+		ContactInfo: &ari.ContactInfo{URI: "sip:201@100.100.56.35:54482;myvoip-reg=t1", ContactStatus: "Reachable", AOR: "201"}})
 	_, _ = f.ctrl.Ready(context.Background(), "d-1", id, "t1")
 	devCh := "myvoip-dev-" + id
 	waitFor(t, func() bool { return f.ari.has("dial " + devCh + " caller=") })
+	if !f.ari.has("create PJSIP/201/sip:201@100.100.56.35:54482;myvoip-reg=t1 device," + id) {
+		t.Fatalf("test call must target the contact from the event, ops=%v", f.ari.ops)
+	}
 	f.ctrl.HandleEvent(ari.Event{Type: "StasisStart", Args: []string{"device", id}, Channel: &ari.Channel{ID: devCh}})
 	if !f.ari.has("play " + devCh + " sound:hello-world") {
 		t.Fatal("prompt not played")

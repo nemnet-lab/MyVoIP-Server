@@ -21,19 +21,20 @@ import (
 
 type nopARI struct{}
 
-func (nopARI) Ring(context.Context, string) error                          { return nil }
-func (nopARI) Answer(context.Context, string) error                        { return nil }
-func (nopARI) Hangup(context.Context, string, string) error                { return nil }
-func (nopARI) CreateChannel(context.Context, string, string, string) error { return nil }
-func (nopARI) SetVariable(context.Context, string, string, string) error   { return nil }
-func (nopARI) Dial(context.Context, string, string, int) error             { return nil }
-func (nopARI) CreateBridge(context.Context, string) error                  { return nil }
-func (nopARI) AddToBridge(context.Context, string, ...string) error        { return nil }
-func (nopARI) DestroyBridge(context.Context, string) error                 { return nil }
-func (nopARI) GetGlobal(context.Context, string) (string, error)           { return "", nil }
-func (nopARI) Play(context.Context, string, string, string) error          { return nil }
-func (nopARI) Record(context.Context, string, string, int) error           { return nil }
-func (nopARI) DeleteStoredRecording(context.Context, string) error         { return nil }
+func (nopARI) Ring(context.Context, string) error                            { return nil }
+func (nopARI) Answer(context.Context, string) error                          { return nil }
+func (nopARI) Hangup(context.Context, string, string) error                  { return nil }
+func (nopARI) CreateChannel(context.Context, string, string, string) error   { return nil }
+func (nopARI) SetVariable(context.Context, string, string, string) error     { return nil }
+func (nopARI) Dial(context.Context, string, string, int) error               { return nil }
+func (nopARI) CreateBridge(context.Context, string) error                    { return nil }
+func (nopARI) AddToBridge(context.Context, string, ...string) error          { return nil }
+func (nopARI) DestroyBridge(context.Context, string) error                   { return nil }
+func (nopARI) GetChannelVar(context.Context, string, string) (string, error) { return "", nil }
+func (nopARI) EndpointState(context.Context, string, string) (string, error) { return "offline", nil }
+func (nopARI) Play(context.Context, string, string, string) error            { return nil }
+func (nopARI) Record(context.Context, string, string, int) error             { return nil }
+func (nopARI) DeleteStoredRecording(context.Context, string) error           { return nil }
 
 type nopPusher struct{}
 
