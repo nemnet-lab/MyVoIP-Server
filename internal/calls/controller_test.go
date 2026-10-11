@@ -190,7 +190,8 @@ func TestIncomingAnsweredAndCompleted(t *testing.T) {
 	}
 	waitFor(t, func() bool { return f.status(id).State == StateWaitingReady })
 
-	f.ari.contacts = "PJSIP/201/sip:201@10.0.0.5:5061;transport=tls;myvoip-reg=abc123"
+	// 古い登録が残っていても、今回の接続世代の Contact だけを呼ぶ
+	f.ari.contacts = "PJSIP/201/sip:201@10.0.0.5:40000;myvoip-reg=old999&PJSIP/201/sip:201@10.0.0.5:5061;transport=tls;myvoip-reg=abc123"
 	st, err := f.ctrl.Ready(context.Background(), "d-1", id, "abc123")
 	if err != nil || st.State != StateInviting {
 		t.Fatalf("ready: %v %+v", err, st)
@@ -200,8 +201,8 @@ func TestIncomingAnsweredAndCompleted(t *testing.T) {
 	if !f.ari.has("var " + devCh + " PJSIP_HEADER(add,X-MyVoIP-Call-ID)=" + id) {
 		t.Fatal("correlation header not set")
 	}
-	if !f.ari.has("create PJSIP/201 device," + id) {
-		t.Fatal("device leg not created on endpoint")
+	if !f.ari.has("create PJSIP/201/sip:201@10.0.0.5:5061;transport=tls;myvoip-reg=abc123 device," + id) {
+		t.Fatalf("device leg must target the current contact, ops=%v", f.ari.ops)
 	}
 
 	// 重複 ready は同じ結果で、二重発呼しない（R-03）
@@ -262,7 +263,7 @@ func TestCallerCancelBeforeReadyLeavesNoGhostCall(t *testing.T) {
 func TestLateDeviceAnswerAfterEndIsHungUp(t *testing.T) {
 	f := newFixture(t, 30*time.Second)
 	id := f.incoming("caller-3")
-	f.ari.contacts = "...;myvoip-reg=r1"
+	f.ari.contacts = "PJSIP/201/sip:201@10.0.0.5:5060;myvoip-reg=r1"
 	_, _ = f.ctrl.Ready(context.Background(), "d-1", id, "r1")
 	devCh := "myvoip-dev-" + id
 	waitFor(t, func() bool { return f.ari.has("dial " + devCh) })
@@ -292,12 +293,22 @@ func TestRingTimeout(t *testing.T) {
 func TestContactMustMatchRegistration(t *testing.T) {
 	f := newFixture(t, 30*time.Second)
 	id := f.incoming("caller-5")
-	// 古い Contact しかない
+	// 古い Contact しかない（接続世代の前方一致にも反応しない）
 	f.ari.contacts = "PJSIP/201/sip:201@10.0.0.5:5061;myvoip-reg=old"
 	_, _ = f.ctrl.Ready(context.Background(), "d-1", id, "new")
 	waitFor(t, func() bool { return f.status(id).State == StateEnded })
 	if *f.status(id).EndReason != ReasonDeviceUnreachable || f.ari.has("create ") {
 		t.Fatal("must not dial stale contact")
+	}
+}
+
+func TestCurrentContact(t *testing.T) {
+	contacts := "PJSIP/9002/sip:9002@100.101.1.2:51000;myvoip-reg=aaa&PJSIP/9002/sip:9002@100.101.1.2:52000;myvoip-reg=bbb"
+	if got := currentContact(contacts, "bbb"); got != "PJSIP/9002/sip:9002@100.101.1.2:52000;myvoip-reg=bbb" {
+		t.Fatalf("got %q", got)
+	}
+	if currentContact(contacts, "ccc") != "" || currentContact(contacts, "") != "" || currentContact("", "aaa") != "" {
+		t.Fatal("unexpected match")
 	}
 }
 
@@ -365,7 +376,7 @@ func TestTestCallPlaysRecordsAndEnds(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-f.push.sent
-	f.ari.contacts = ";myvoip-reg=t1"
+	f.ari.contacts = "PJSIP/201/sip:201@10.0.0.5:5060;myvoip-reg=t1"
 	_, _ = f.ctrl.Ready(context.Background(), "d-1", id, "t1")
 	devCh := "myvoip-dev-" + id
 	waitFor(t, func() bool { return f.ari.has("dial " + devCh + " caller=") })

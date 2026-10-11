@@ -365,9 +365,12 @@ func (c *Controller) dialDevice(callID string) {
 		deadline = call.ExpiresAt
 	}
 	found := false
+	dialTarget := "PJSIP/" + endpoint
 	for {
 		contacts, err := c.ari.GetGlobal(ctx, fmt.Sprintf("PJSIP_DIAL_CONTACTS(%s)", endpoint))
-		if err == nil && strings.Contains(contacts, "myvoip-reg="+regID) {
+		if target := currentContact(contacts, regID); err == nil && target != "" {
+			// 古い Contact が残っていても（max_contacts>1・remove_existing=no）、今回の登録先だけを呼ぶ
+			dialTarget = target
 			found = true
 			break
 		}
@@ -401,7 +404,7 @@ func (c *Controller) dialDevice(callID string) {
 	callerChannel := a.call.CallerChannel
 	c.mu.Unlock()
 
-	err := c.ari.CreateChannel(ctx, "PJSIP/"+endpoint, "device,"+callID, channelID)
+	err := c.ari.CreateChannel(ctx, dialTarget, "device,"+callID, channelID)
 	if err == nil {
 		// 相関ヘッダーで Push と同じ呼に結び付ける。外部由来の同名ヘッダーは新しいチャネルに引き継がれない
 		err = c.ari.SetVariable(ctx, channelID, "PJSIP_HEADER(add,X-MyVoIP-Call-ID)", callID)
@@ -425,6 +428,21 @@ func (c *Controller) dialDevice(callID string) {
 		return
 	}
 	log.Info("device leg dialing")
+}
+
+// currentContact は PJSIP_DIAL_CONTACTS の結果（"PJSIP/201/sip:...&PJSIP/201/sip:..."）から、
+// 今回の REGISTER の接続世代を含む Contact への発呼先を返す。見つからなければ空。
+func currentContact(contacts, regID string) string {
+	if regID == "" {
+		return ""
+	}
+	for _, item := range strings.Split(contacts, "&") {
+		item = strings.TrimSpace(item)
+		if strings.Contains(item, "myvoip-reg="+regID) && strings.HasPrefix(item, "PJSIP/") {
+			return item
+		}
+	}
+	return ""
 }
 
 func (c *Controller) onDeviceRinging(channelID string) {

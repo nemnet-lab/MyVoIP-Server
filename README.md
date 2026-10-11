@@ -159,7 +159,20 @@ Stasis(myvoip,201)
 - サーバーは端末へ発呼するとき、ダイヤルプランを通らず `PJSIP/<endpoint>` を直接呼びます。そのため、iPhone 用 SIP 内線への着信が再びこのルートに入るループは起きません。
 - MikoPBX の「ダイヤルプランアプリケーション」などの管理画面で保持できる方法で設定してください。生成済みの設定ファイルを直接書き換える方法は、設定の再生成で消えるため使いません。
 
-利用者がダイヤルする番号を `Stasis` に向ける方法は、MikoPBX の版によって選択肢が変わります。版を教えていただければ、具体的な手順に落とし込みます。
+利用者がダイヤルする番号を `Stasis` に向ける方法の例（MikoPBX 2024.1）：
+
+- **別の番号から渡す**：ダイヤルプランアプリケーションで、別の番号（例 `7201`）に `Stasis(myvoip,201)` を書く。保存しても dialplan reload だけで済む。内線番号そのものへの着信は iPhone に届かない（アプリは相関ヘッダーのない INVITE を拒否する）。
+- **内線番号への着信を渡す**：MikoPBX が生成する `[internal-users]` は、Dial の前に `internal-users-custom` コンテキストに同じ番号があればそちらへ Gosub する。「システムファイルのカスタマイズ」で `/etc/asterisk/extensions.conf` に次を追記する（append モード。保存時は reload だけで通話は切れない）。不在時の転送やボイスメールは Stasis 側で扱うことになる。
+
+  ```
+  [internal-users-custom]
+  exten => 201,1,Stasis(myvoip,201)
+   same => n,Hangup()
+  ```
+
+### 内線の登録数の設定
+
+アプリは SIP 接続を張り直すたびに新しい Contact（接続世代 `myvoip-reg=…` 付き）で登録します。サーバーは ready のときに今回の Contact を確かめ、その Contact だけを直接呼ぶ（`PJSIP/<内線>/sip:…`）ため、古い Contact が残っていても誤った宛先には発呼しません。それでも、MyVoIP 専用の内線は `max_contacts=1`・`remove_existing=yes` にしておくと、MikoPBX 側の Contact の一覧が分かりやすくなります。
 
 ## 7. 運用
 
