@@ -291,7 +291,8 @@ func (c *Controller) HandleEvent(ev ari.Event) {
 			ext = ev.Args[0]
 		}
 		if !c.firstTimeCaller(ev.Channel.ID) {
-			c.log.Warn("duplicate StasisStart for caller ignored", "caller_channel", ev.Channel.ID)
+			// 終話の後片付けで、同じ発信側チャネルの StasisStart がもう一度届くことがある。呼は作らない
+			c.log.Debug("repeated StasisStart for caller ignored", "caller_channel", ev.Channel.ID, "timestamp", ev.Timestamp)
 			return
 		}
 		c.onIncoming(*ev.Channel, ext)
