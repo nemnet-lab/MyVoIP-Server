@@ -1,6 +1,8 @@
 // Package web は Discord でログインする Web 管理画面。
 //
-// 利用者は自分の iPhone を作成し（pool の空き内線を1台に1つ割り当てる）、アプリに入力する登録コードを発行する。
+// 利用者はそれぞれ自分の PBX（MikoPBX・Asterisk）を持つ。利用者は自分の PBX の接続先（Tailnet のアドレス）を設定し、
+// iPhone ごとに PBX の内線（番号と SIP パスワード）を登録して、アプリに入力する登録コードを発行する。
+// 中継用 Asterisk は、その内線として利用者の PBX に登録する（1内線につき iPhone 1台）。
 // 管理者のサポートが必要なときは、利用者がサポート用パスコードを発行して管理者に伝える。
 // 管理者はそのパスコードで、期限付きで利用者の画面を開いて操作できる（操作は利用者の画面に記録される）。
 package web
@@ -18,6 +20,8 @@ import (
 	"log/slog"
 	"math/big"
 	"net/http"
+	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -47,6 +51,9 @@ type Config struct {
 	// Relay は中継モード（iPhone を削除したら中継用のパスワードを作り直し、設定を反映する）
 	Relay bool
 	Web   config.WebConfig
+	// EndpointState は中継用 Asterisk の PJSIP エンドポイントの状態（online / offline）を返す。
+	// 利用者の PBX に届いているかの表示に使う（nil なら表示しない）
+	EndpointState func(ctx context.Context, resource string) (string, error)
 	// DiscordAPI と DiscordAuthorizeURL は試験で差し替える（空なら Discord 本番）
 	DiscordAPI          string
 	DiscordAuthorizeURL string
@@ -113,7 +120,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /auth/discord/callback", s.callback)
 	mux.HandleFunc("POST /logout", s.withUser(s.logout))
 
+	mux.HandleFunc("POST /pbx", s.withUser(s.self(s.savePBX)))
 	mux.HandleFunc("POST /phones", s.withUser(s.self(s.addPhone)))
+	mux.HandleFunc("POST /phones/{number}/sip", s.withUser(s.self(s.updateSIP)))
 	mux.HandleFunc("POST /phones/{number}/code", s.withUser(s.self(s.issueCode)))
 	mux.HandleFunc("POST /phones/{number}/rename", s.withUser(s.self(s.renamePhone)))
 	mux.HandleFunc("POST /phones/{number}/delete", s.withUser(s.self(s.deletePhone)))
@@ -122,15 +131,15 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /admin", s.withUser(s.adminOnly(s.adminPage)))
 	mux.HandleFunc("POST /admin/support", s.withUser(s.adminOnly(s.startSupport)))
-	mux.HandleFunc("POST /admin/extensions", s.withUser(s.adminOnly(s.saveExtension)))
-	mux.HandleFunc("POST /admin/extensions/{number}/pool", s.withUser(s.adminOnly(s.setPool)))
 	mux.HandleFunc("POST /admin/extensions/{number}/assign", s.withUser(s.adminOnly(s.assignExtension)))
 	mux.HandleFunc("POST /admin/extensions/{number}/release", s.withUser(s.adminOnly(s.releaseExtension)))
 	mux.HandleFunc("POST /admin/users/{id}/disabled", s.withUser(s.adminOnly(s.setUserDisabled)))
 
 	mux.HandleFunc("GET /support", s.withUser(s.adminOnly(s.supportDashboard)))
 	mux.HandleFunc("POST /support/end", s.withUser(s.adminOnly(s.endSupport)))
+	mux.HandleFunc("POST /support/pbx", s.withUser(s.adminOnly(s.support(s.savePBX))))
 	mux.HandleFunc("POST /support/phones", s.withUser(s.adminOnly(s.support(s.addPhone))))
+	mux.HandleFunc("POST /support/phones/{number}/sip", s.withUser(s.adminOnly(s.support(s.updateSIP))))
 	mux.HandleFunc("POST /support/phones/{number}/code", s.withUser(s.adminOnly(s.support(s.issueCode))))
 	mux.HandleFunc("POST /support/phones/{number}/rename", s.withUser(s.adminOnly(s.support(s.renamePhone))))
 	mux.HandleFunc("POST /support/phones/{number}/delete", s.withUser(s.adminOnly(s.support(s.deletePhone))))
@@ -188,6 +197,8 @@ func (s *Server) message(w http.ResponseWriter, status int, rc *reqCtx, title, t
 // notices は画面上部に出すお知らせ（任意の文字列を URL から表示しないよう、決まった文だけ）。
 var notices = map[string]string{
 	"added":           "iPhone を追加しました。「登録コードを発行」から、アプリに入力するコードを表示できます。",
+	"pbx_saved":       "PBX の設定を保存しました。",
+	"sip_saved":       "内線の設定を保存しました。",
 	"deleted":         "iPhone を削除しました。その iPhone のアプリは使えなくなります。",
 	"renamed":         "名前を変更しました。",
 	"passcode_delete": "サポート用パスコードを取り消しました。",
@@ -395,15 +406,19 @@ func (s *Server) enrollInfo(w http.ResponseWriter, _ *http.Request) {
 // --- 利用者の画面
 
 type phoneView struct {
-	Number      string
-	Label       string
-	DisplayName string
-	Enrolled    bool
-	DeviceName  string
-	AppVersion  string
-	Enabled     bool
-	PushReady   bool
-	EnrolledAt  time.Time
+	Number       string
+	PBXExtension string
+	SIPUser      string
+	AuthUser     string
+	Label        string
+	Enrolled     bool
+	DeviceName   string
+	AppVersion   string
+	Enabled      bool
+	PushReady    bool
+	EnrolledAt   time.Time
+	// PBXState は中継用 Asterisk から PBX に届いているか（"online" / "offline" / 不明なら空）
+	PBXState string
 }
 
 type auditView struct {
@@ -414,10 +429,12 @@ type auditView struct {
 }
 
 type dashboardData struct {
-	Phones   []phoneView
-	Max      int
-	CanAdd   bool
-	NoFree   bool
+	Phones []phoneView
+	Max    int
+	CanAdd bool
+	// PBXHost / PBXPort は利用者の PBX（未設定なら PBXHost が空）
+	PBXHost  string
+	PBXPort  int
 	Passcode *store.SupportPasscode
 	Audit    []auditView
 	// Base は操作の送り先（本人は ""、管理者のサポート中は "/support"）
@@ -434,7 +451,33 @@ var actionLabels = map[string]string{
 	"support_started":  "管理者がサポートを開始",
 	"support_ended":    "管理者がサポートを終了",
 	"phone_assigned":   "管理者が内線を割り当て",
+	"pbx_changed":      "PBX の設定を変更",
+	"sip_changed":      "内線の設定を変更",
 	"phone_released":   "管理者が iPhone を削除",
+}
+
+// displayNumber は画面に出す内線番号（利用者の PBX での番号。なければサーバー内の識別子）。
+func displayNumber(e store.Extension) string {
+	if e.PBXExtension != "" {
+		return e.PBXExtension
+	}
+	return e.Number
+}
+
+func (s *Server) phoneViewOf(ctx context.Context, e store.Extension) phoneView {
+	v := phoneView{Number: e.Number, PBXExtension: displayNumber(e), SIPUser: e.SIPUsername, AuthUser: e.SIPAuthUsername, Label: e.Label}
+	if d, err := s.store.ActiveDeviceForExtension(ctx, e.Number); err == nil {
+		v.Enrolled, v.DeviceName, v.AppVersion = true, d.Name, d.AppVersion
+		v.Enabled, v.PushReady, v.EnrolledAt = d.Enabled, d.VoIPToken != "", d.CreatedAt
+	}
+	if s.cfg.Relay && s.cfg.EndpointState != nil {
+		stateCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		if state, err := s.cfg.EndpointState(stateCtx, relay.UpstreamEndpoint(e.Number)); err == nil {
+			v.PBXState = state
+		}
+		cancel()
+	}
+	return v
 }
 
 func (s *Server) dashboardFor(ctx context.Context, subject store.User, base string) (dashboardData, error) {
@@ -442,29 +485,11 @@ func (s *Server) dashboardFor(ctx context.Context, subject store.User, base stri
 	if err != nil {
 		return dashboardData{}, err
 	}
-	data := dashboardData{Max: s.cfg.Web.MaxPhonesPerUser, Base: base}
+	data := dashboardData{Max: s.cfg.Web.MaxPhonesPerUser, Base: base, PBXHost: subject.PBXHost, PBXPort: subject.PBXPort}
 	for _, e := range exts {
-		v := phoneView{Number: e.Number, Label: e.Label, DisplayName: e.DisplayName}
-		if d, err := s.store.ActiveDeviceForExtension(ctx, e.Number); err == nil {
-			v.Enrolled, v.DeviceName, v.AppVersion = true, d.Name, d.AppVersion
-			v.Enabled, v.PushReady, v.EnrolledAt = d.Enabled, d.VoIPToken != "", d.CreatedAt
-		}
-		data.Phones = append(data.Phones, v)
+		data.Phones = append(data.Phones, s.phoneViewOf(ctx, e))
 	}
 	data.CanAdd = len(exts) < data.Max
-	if data.CanAdd {
-		all, err := s.store.ListExtensions(ctx)
-		if err != nil {
-			return dashboardData{}, err
-		}
-		data.NoFree = true
-		for _, e := range all {
-			if e.Pool && e.OwnerUserID == "" {
-				data.NoFree = false
-				break
-			}
-		}
-	}
 	if p, err := s.store.GetSupportPasscode(ctx, subject.ID); err == nil && time.Now().Before(p.ExpiresAt) {
 		data.Passcode = &p
 	}
@@ -573,42 +598,177 @@ func (s *Server) ownedExtension(ctx context.Context, subject store.User, number 
 	return e, true
 }
 
-// resetCredentials は内線の iPhone を失効させ、中継用のパスワードを作り直す（前の利用者の iPhone で登録できないように）。
-func (s *Server) resetCredentials(ctx context.Context, number string) error {
-	if d, err := s.store.ActiveDeviceForExtension(ctx, number); err == nil {
-		if err := s.store.RevokeDevice(ctx, d.ID, time.Now()); err != nil {
-			return err
+// newLineID はサーバー内の内線の識別子を作る（中継用 Asterisk のエンドポイント名・iPhone の SIP ユーザー名）。
+// 別々の PBX に同じ内線番号があっても重ならないよう、PBX の内線番号とは別に振る。
+func newLineID() string {
+	var sb strings.Builder
+	sb.WriteString("mv")
+	for i := 0; i < 10; i++ {
+		n, err := rand.Int(rand.Reader, big.NewInt(10))
+		if err != nil {
+			panic(err)
 		}
+		sb.WriteByte(byte('0' + n.Int64()))
 	}
-	if s.cfg.Relay {
-		return s.store.SetMobilePassword(ctx, number, s.box.Seal(relay.NewPassword()))
+	return sb.String()
+}
+
+// sipForm は内線の SIP の設定の入力（PBX での内線番号・SIP ユーザー名・認証ユーザー名・パスワード）。
+type sipForm struct {
+	PBXExtension string
+	SIPUser      string
+	AuthUser     string
+	Password     string
+}
+
+func readSIPForm(r *http.Request) (sipForm, string) {
+	f := sipForm{
+		PBXExtension: strings.TrimSpace(r.PostFormValue("pbx_extension")),
+		SIPUser:      strings.TrimSpace(r.PostFormValue("sip_user")),
+		AuthUser:     strings.TrimSpace(r.PostFormValue("auth_user")),
+		Password:     r.PostFormValue("password"),
 	}
-	return nil
+	if f.SIPUser == "" {
+		f.SIPUser = f.PBXExtension
+	}
+	if f.AuthUser == "" {
+		f.AuthUser = f.SIPUser
+	}
+	if !validName(f.PBXExtension) || !validName(f.SIPUser) || !validName(f.AuthUser) {
+		return f, "内線番号・SIP ユーザー名・認証ユーザー名には、英数字と . _ + - だけを使えます（40文字まで）。"
+	}
+	if len(f.Password) > 128 || strings.ContainsFunc(f.Password, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
+		return f, "SIP パスワードに使えない文字が含まれています。"
+	}
+	return f, ""
 }
 
 func (s *Server) addPhone(w http.ResponseWriter, r *http.Request, rc *reqCtx, subject store.User, base string) {
 	ctx := r.Context()
+	if subject.PBXHost == "" {
+		s.message(w, http.StatusConflict, rc, "追加できません", "先に「PBX の設定」で、あなたの PBX のアドレスを保存してください。")
+		return
+	}
+	form, problem := readSIPForm(r)
+	if problem == "" && form.Password == "" {
+		problem = "SIP パスワード（PBX の内線設定の値）を入力してください。"
+	}
+	if problem != "" {
+		s.message(w, http.StatusBadRequest, rc, "追加できません", problem)
+		return
+	}
 	label := cleanLabel(r.PostFormValue("label"))
-	e, err := s.store.AssignFreeExtension(ctx, subject.ID, label, s.cfg.Web.MaxPhonesPerUser, time.Now())
+	e := store.Extension{
+		Number: newLineID(), DisplayName: label, SIPUsername: form.SIPUser, SIPAuthUsername: form.AuthUser,
+		SIPPasswordEnc: s.box.Seal(form.Password), Endpoint: form.SIPUser, RingTimeoutSeconds: 30,
+		MobilePasswordEnc: s.box.Seal(relay.NewPassword()), OwnerUserID: subject.ID, PBXExtension: form.PBXExtension, Label: label,
+	}
+	err := s.store.CreateOwnedExtension(ctx, e, s.cfg.Web.MaxPhonesPerUser, time.Now())
 	switch {
 	case errors.Is(err, store.ErrLimit):
 		s.message(w, http.StatusConflict, rc, "追加できません", fmt.Sprintf("iPhone は %d 台まで作成できます。使わない iPhone を削除してから追加してください。", s.cfg.Web.MaxPhonesPerUser))
 		return
-	case errors.Is(err, store.ErrNoFreeExtension):
-		s.message(w, http.StatusConflict, rc, "追加できません", "割り当てられる内線が残っていません。管理者に内線の追加を依頼してください。")
+	case errors.Is(err, store.ErrDuplicate):
+		s.message(w, http.StatusConflict, rc, "追加できません", "この SIP ユーザーの内線はすでに登録しています。1つの内線で使える iPhone は1台です。")
 		return
 	case err != nil:
-		s.log.Error("web: assign extension", "error", err)
+		s.log.Error("web: create extension", "error", err)
 		s.message(w, http.StatusInternalServerError, rc, "エラー", "iPhone を追加できませんでした。")
 		return
 	}
-	if err := s.resetCredentials(ctx, e.Number); err != nil {
-		s.log.Error("web: reset credentials", "extension", e.Number, "error", err)
-	}
-	s.log.Info("web: phone added", "user_id", subject.ID, "extension", e.Number, "actor", rc.user.ID)
-	s.audit(ctx, subject.ID, rc.user.ID, "phone_added", fmt.Sprintf("%s（内線 %s）", label, e.Number))
+	s.log.Info("web: phone added", "user_id", subject.ID, "line", e.Number, "pbx_extension", e.PBXExtension, "actor", rc.user.ID)
+	s.audit(ctx, subject.ID, rc.user.ID, "phone_added", fmt.Sprintf("%s（内線 %s）", label, e.PBXExtension))
 	ok := s.applyRelay(ctx)
 	http.Redirect(w, r, backTo(base, "added", ok), http.StatusSeeOther)
+}
+
+// updateSIP は内線の SIP の設定を変える（パスワードが空なら変えない）。
+func (s *Server) updateSIP(w http.ResponseWriter, r *http.Request, rc *reqCtx, subject store.User, base string) {
+	ctx := r.Context()
+	e, ok := s.ownedExtension(ctx, subject, r.PathValue("number"))
+	if !ok {
+		s.message(w, http.StatusNotFound, rc, "見つかりません", "この iPhone は見つかりません。")
+		return
+	}
+	form, problem := readSIPForm(r)
+	if problem != "" {
+		s.message(w, http.StatusBadRequest, rc, "保存できません", problem)
+		return
+	}
+	if form.SIPUser != e.SIPUsername {
+		others, err := s.store.ListExtensionsByOwner(ctx, subject.ID)
+		if err != nil {
+			s.message(w, http.StatusInternalServerError, rc, "エラー", "保存できませんでした。")
+			return
+		}
+		for _, o := range others {
+			if o.Number != e.Number && o.SIPUsername == form.SIPUser {
+				s.message(w, http.StatusConflict, rc, "保存できません", "この SIP ユーザーの内線はすでに登録しています。")
+				return
+			}
+		}
+	}
+	var passwordEnc []byte
+	if form.Password != "" {
+		passwordEnc = s.box.Seal(form.Password)
+	}
+	if err := s.store.UpdateExtensionSIP(ctx, e.Number, form.PBXExtension, form.SIPUser, form.AuthUser, passwordEnc); err != nil {
+		s.log.Error("web: update extension", "error", err)
+		s.message(w, http.StatusInternalServerError, rc, "エラー", "保存できませんでした。")
+		return
+	}
+	s.log.Info("web: extension sip updated", "user_id", subject.ID, "line", e.Number, "password_changed", passwordEnc != nil, "actor", rc.user.ID)
+	s.audit(ctx, subject.ID, rc.user.ID, "sip_changed", fmt.Sprintf("%s（内線 %s）", e.Label, form.PBXExtension))
+	ok = s.applyRelay(ctx)
+	http.Redirect(w, r, backTo(base, "sip_saved", ok), http.StatusSeeOther)
+}
+
+// savePBX は利用者の PBX の接続先を保存する。このサーバーから SIP を送る先になるため、許可したアドレス帯の IP アドレスだけを受け付ける。
+func (s *Server) savePBX(w http.ResponseWriter, r *http.Request, rc *reqCtx, subject store.User, base string) {
+	ctx := r.Context()
+	addr, err := netip.ParseAddr(strings.TrimSpace(r.PostFormValue("host")))
+	if err != nil || addr.Zone() != "" {
+		s.message(w, http.StatusBadRequest, rc, "保存できません", "PBX の IP アドレスを入力してください（例 100.64.0.10）。")
+		return
+	}
+	addr = addr.Unmap()
+	if !s.pbxAllowed(addr) {
+		s.message(w, http.StatusBadRequest, rc, "保存できません", "このアドレスは PBX として使えません。Tailnet の IP アドレス（100.x.y.z）を入力してください。")
+		return
+	}
+	port := 5060
+	if raw := strings.TrimSpace(r.PostFormValue("port")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > 65535 {
+			s.message(w, http.StatusBadRequest, rc, "保存できません", "ポート番号は 1〜65535 で入力してください（通常は 5060）。")
+			return
+		}
+		port = n
+	}
+	if err := s.store.SetUserPBX(ctx, subject.ID, addr.String(), port); err != nil {
+		s.log.Error("web: save pbx", "error", err)
+		s.message(w, http.StatusInternalServerError, rc, "エラー", "保存できませんでした。")
+		return
+	}
+	s.log.Info("web: pbx saved", "user_id", subject.ID, "pbx", fmt.Sprintf("%s:%d", addr, port), "actor", rc.user.ID)
+	s.audit(ctx, subject.ID, rc.user.ID, "pbx_changed", fmt.Sprintf("%s:%d", addr, port))
+	ok := s.applyRelay(ctx)
+	http.Redirect(w, r, backTo(base, "pbx_saved", ok), http.StatusSeeOther)
+}
+
+func (s *Server) pbxAllowed(addr netip.Addr) bool {
+	if addr.IsLoopback() || addr.IsUnspecified() || addr.IsMulticast() || addr.IsLinkLocalUnicast() {
+		return false
+	}
+	if len(s.cfg.Web.AllowedPBX) == 0 {
+		return true
+	}
+	for _, p := range s.cfg.Web.AllowedPBX {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 type codeData struct {
@@ -639,11 +799,11 @@ func (s *Server) issueCode(w http.ResponseWriter, r *http.Request, rc *reqCtx, s
 	if err != nil {
 		s.log.Error("web: qr", "error", err)
 	}
-	s.log.Info("web: enrollment code issued", "user_id", subject.ID, "extension", e.Number, "actor", rc.user.ID)
-	s.audit(ctx, subject.ID, rc.user.ID, "code_issued", fmt.Sprintf("%s（内線 %s）", e.Label, e.Number))
+	s.log.Info("web: enrollment code issued", "user_id", subject.ID, "line", e.Number, "actor", rc.user.ID)
+	s.audit(ctx, subject.ID, rc.user.ID, "code_issued", fmt.Sprintf("%s（内線 %s）", e.Label, displayNumber(e)))
 	p := rc.page("登録コード")
 	p.Data = codeData{
-		Phone: phoneView{Number: e.Number, Label: e.Label}, Code: secret.FormatCode(code), PublicURL: s.cfg.PublicURL,
+		Phone: phoneView{Number: e.Number, PBXExtension: displayNumber(e), Label: e.Label}, Code: secret.FormatCode(code), PublicURL: s.cfg.PublicURL,
 		QR:        template.URL("data:image/png;base64," + base64.StdEncoding.EncodeToString(png)), //nolint:gosec // 自分で作った PNG
 		ExpiresAt: expires, Base: base,
 	}
@@ -662,7 +822,7 @@ func (s *Server) renamePhone(w http.ResponseWriter, r *http.Request, rc *reqCtx,
 		s.message(w, http.StatusInternalServerError, rc, "エラー", "名前を変更できませんでした。")
 		return
 	}
-	s.audit(ctx, subject.ID, rc.user.ID, "phone_renamed", fmt.Sprintf("%s → %s（内線 %s）", e.Label, label, e.Number))
+	s.audit(ctx, subject.ID, rc.user.ID, "phone_renamed", fmt.Sprintf("%s → %s（内線 %s）", e.Label, label, displayNumber(e)))
 	http.Redirect(w, r, backTo(base, "renamed", true), http.StatusSeeOther)
 }
 
@@ -679,6 +839,8 @@ func (s *Server) release(ctx context.Context, number string) (bool, error) {
 	return s.applyRelay(ctx), nil
 }
 
+// deletePhone は iPhone（内線）を削除する。Web で登録した内線は丸ごと消し、
+// 管理コマンドで登録して利用者に割り当てた内線は、割り当てだけを外す（管理者の設定は残す）。
 func (s *Server) deletePhone(w http.ResponseWriter, r *http.Request, rc *reqCtx, subject store.User, base string) {
 	ctx := r.Context()
 	e, ok := s.ownedExtension(ctx, subject, r.PathValue("number"))
@@ -686,14 +848,22 @@ func (s *Server) deletePhone(w http.ResponseWriter, r *http.Request, rc *reqCtx,
 		s.message(w, http.StatusNotFound, rc, "見つかりません", "この iPhone は見つかりません。")
 		return
 	}
-	synced, err := s.release(ctx, e.Number)
+	var synced bool
+	var err error
+	if e.PBXExtension != "" {
+		if err = s.store.DeleteExtension(ctx, e.Number); err == nil {
+			synced = s.applyRelay(ctx)
+		}
+	} else {
+		synced, err = s.release(ctx, e.Number)
+	}
 	if err != nil {
-		s.log.Error("web: release extension", "extension", e.Number, "error", err)
+		s.log.Error("web: delete extension", "line", e.Number, "error", err)
 		s.message(w, http.StatusInternalServerError, rc, "エラー", "iPhone を削除できませんでした。")
 		return
 	}
-	s.log.Info("web: phone deleted", "user_id", subject.ID, "extension", e.Number, "actor", rc.user.ID)
-	s.audit(ctx, subject.ID, rc.user.ID, "phone_deleted", fmt.Sprintf("%s（内線 %s）", e.Label, e.Number))
+	s.log.Info("web: phone deleted", "user_id", subject.ID, "line", e.Number, "actor", rc.user.ID)
+	s.audit(ctx, subject.ID, rc.user.ID, "phone_deleted", fmt.Sprintf("%s（内線 %s）", e.Label, displayNumber(e)))
 	http.Redirect(w, r, backTo(base, "deleted", synced), http.StatusSeeOther)
 }
 
@@ -813,16 +983,16 @@ type adminUserView struct {
 
 type adminExtensionView struct {
 	Ext       store.Extension
+	Display   string
 	OwnerName string
+	PBX       string
 	Enrolled  bool
-	InRelay   bool
 }
 
 type adminData struct {
 	Users      []adminUserView
 	Extensions []adminExtensionView
 	Relay      bool
-	FreeCount  int
 }
 
 func (s *Server) adminPage(w http.ResponseWriter, r *http.Request, rc *reqCtx) {
@@ -837,18 +1007,20 @@ func (s *Server) adminPage(w http.ResponseWriter, r *http.Request, rc *reqCtx) {
 		s.message(w, http.StatusInternalServerError, rc, "エラー", "画面を表示できませんでした。")
 		return
 	}
-	names := map[string]string{}
+	byID := map[string]store.User{}
 	counts := map[string]int{}
 	for _, u := range users {
-		names[u.ID] = u.DisplayName
+		byID[u.ID] = u
 	}
 	data := adminData{Relay: s.cfg.Relay}
 	for _, e := range exts {
-		v := adminExtensionView{Ext: e, OwnerName: names[e.OwnerUserID], InRelay: !e.Pool || e.OwnerUserID != ""}
-		if e.OwnerUserID != "" {
-			counts[e.OwnerUserID]++
-		} else if e.Pool {
-			data.FreeCount++
+		v := adminExtensionView{Ext: e, Display: displayNumber(e), PBX: "既定の PBX"}
+		if owner, ok := byID[e.OwnerUserID]; ok {
+			v.OwnerName = owner.DisplayName
+			counts[owner.ID]++
+			if owner.PBXHost != "" {
+				v.PBX = fmt.Sprintf("%s:%d", owner.PBXHost, owner.PBXPort)
+			}
 		}
 		if _, err := s.store.ActiveDeviceForExtension(ctx, e.Number); err == nil {
 			v.Enrolled = true
@@ -864,48 +1036,6 @@ func (s *Server) adminPage(w http.ResponseWriter, r *http.Request, rc *reqCtx) {
 	s.render(w, http.StatusOK, "admin", p)
 }
 
-// saveExtension は MikoPBX で作った内線を登録・更新する（SIP パスワードは暗号化して保存する）。
-func (s *Server) saveExtension(w http.ResponseWriter, r *http.Request, rc *reqCtx) {
-	ctx := r.Context()
-	number := strings.TrimSpace(r.PostFormValue("number"))
-	sipUser := strings.TrimSpace(r.PostFormValue("sip_user"))
-	authUser := strings.TrimSpace(r.PostFormValue("auth_user"))
-	password := r.PostFormValue("password")
-	if sipUser == "" {
-		sipUser = number
-	}
-	if authUser == "" {
-		authUser = sipUser
-	}
-	if !validName(number) || !validName(sipUser) || !validName(authUser) {
-		s.message(w, http.StatusBadRequest, rc, "保存できません", "内線番号・SIP ユーザー名には英数字と . _ + - だけを使えます。")
-		return
-	}
-	if password == "" {
-		s.message(w, http.StatusBadRequest, rc, "保存できません", "SIP パスワード（MikoPBX の内線設定の値）を入力してください。")
-		return
-	}
-	existing, err := s.store.GetExtension(ctx, number)
-	ring := 30
-	if err == nil {
-		ring = existing.RingTimeoutSeconds
-	}
-	if err := s.store.UpsertExtension(ctx, store.Extension{
-		Number: number, DisplayName: strings.TrimSpace(r.PostFormValue("display_name")), SIPUsername: sipUser, SIPAuthUsername: authUser,
-		SIPPasswordEnc: s.box.Seal(password), Endpoint: sipUser, RingTimeoutSeconds: ring,
-	}); err != nil {
-		s.log.Error("web: save extension", "error", err)
-		s.message(w, http.StatusInternalServerError, rc, "エラー", "内線を保存できませんでした。")
-		return
-	}
-	if err := s.store.SetExtensionPool(ctx, number, r.PostFormValue("pool") == "on"); err != nil {
-		s.log.Error("web: set pool", "error", err)
-	}
-	s.log.Info("web: extension saved", "extension", number, "admin", rc.user.ID)
-	ok := s.applyRelay(ctx)
-	http.Redirect(w, r, backTo("/admin", "saved", ok), http.StatusSeeOther)
-}
-
 func validName(v string) bool {
 	if v == "" || len(v) > 40 {
 		return false
@@ -918,18 +1048,8 @@ func validName(v string) bool {
 	return true
 }
 
-func (s *Server) setPool(w http.ResponseWriter, r *http.Request, rc *reqCtx) {
-	ctx := r.Context()
-	number := r.PathValue("number")
-	if err := s.store.SetExtensionPool(ctx, number, r.PostFormValue("pool") == "on"); err != nil {
-		s.message(w, http.StatusNotFound, rc, "見つかりません", "内線が見つかりません。")
-		return
-	}
-	ok := s.applyRelay(ctx)
-	http.Redirect(w, r, backTo("/admin", "saved", ok), http.StatusSeeOther)
-}
-
-// assignExtension は未割り当ての内線を利用者に割り当てる（すでに使っている内線を利用者の管理に移すときなど）。
+// assignExtension は持ち主のいない内線（管理コマンドで登録した内線）を利用者に割り当てる。
+// 利用者が自分の PBX を設定していれば、中継用 Asterisk はその PBX へ登録し直す。
 func (s *Server) assignExtension(w http.ResponseWriter, r *http.Request, rc *reqCtx) {
 	ctx := r.Context()
 	number := r.PathValue("number")

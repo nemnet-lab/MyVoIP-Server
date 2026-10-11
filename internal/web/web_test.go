@@ -7,7 +7,10 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -15,6 +18,7 @@ import (
 
 	"github.com/nemnet-lab/MyVoIP-Server/internal/api"
 	"github.com/nemnet-lab/MyVoIP-Server/internal/config"
+	"github.com/nemnet-lab/MyVoIP-Server/internal/relay"
 	"github.com/nemnet-lab/MyVoIP-Server/internal/secret"
 	"github.com/nemnet-lab/MyVoIP-Server/internal/store"
 )
@@ -63,6 +67,8 @@ type harness struct {
 	web   http.Handler
 	api   http.Handler
 	syncs int
+	// relayDir は中継用 Asterisk の設定の書き出し先（実際の relay.Sync で書く）
+	relayDir string
 }
 
 func newHarness(t *testing.T, roles []string) *harness {
@@ -75,33 +81,30 @@ func newHarness(t *testing.T, roles []string) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := &harness{t: t, st: store.NewMemory(), box: box}
+	h := &harness{t: t, st: store.NewMemory(), box: box, relayDir: t.TempDir()}
 	ctx := context.Background()
-	for _, n := range []string{"9101", "9102", "9103", "9002"} {
-		if err := h.st.UpsertExtension(ctx, store.Extension{
-			Number: n, SIPUsername: n, SIPAuthUsername: n, SIPPasswordEnc: box.Seal("pbx-" + n), Endpoint: n, RingTimeoutSeconds: 30,
-		}); err != nil {
-			t.Fatal(err)
-		}
-		if err := h.st.SetMobilePassword(ctx, n, box.Seal("mobile-"+n)); err != nil {
-			t.Fatal(err)
-		}
-		if n != "9002" {
-			if err := h.st.SetExtensionPool(ctx, n, true); err != nil {
-				t.Fatal(err)
-			}
-		}
+	// 管理コマンドで登録した既存の内線（既定の PBX へ登録する）
+	if err := h.st.UpsertExtension(ctx, store.Extension{
+		Number: "9002", SIPUsername: "9002", SIPAuthUsername: "9002", SIPPasswordEnc: box.Seal("pbx-9002"), Endpoint: "9002", RingTimeoutSeconds: 30,
+	}); err != nil {
+		t.Fatal(err)
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	syncer := func(ctx context.Context) error {
+		h.syncs++
+		_, err := relay.Sync(ctx, h.st, box, relay.Options{UpstreamHost: "100.64.0.10", UpstreamPort: 5060}, h.relayDir, nil)
+		return err
+	}
 	srv, err := New(h.st, box, Config{
 		PublicURL: "http://myvoip.test", EnrollmentCodeTTL: 10 * time.Minute, Relay: true,
 		Web: config.WebConfig{
 			Enabled: true, DiscordClientID: "client-id", DiscordClientSecret: "client-secret",
 			DiscordGuildID: "guild-1", DiscordRoleIDs: roles, AdminIDs: []string{"admin"},
+			AllowedPBX:       []netip.Prefix{netip.MustParsePrefix("100.64.0.0/10")},
 			MaxPhonesPerUser: 2, SessionTTL: time.Hour, SupportCodeTTL: 30 * time.Minute, SupportSessionTTL: time.Hour,
 		},
 		DiscordAPI: ds.URL, DiscordAuthorizeURL: "https://discord.example/oauth2/authorize",
-	}, func(context.Context) error { h.syncs++; return nil }, log)
+	}, syncer, log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,6 +114,15 @@ func newHarness(t *testing.T, roles []string) *harness {
 		AccessTokenTTL: time.Hour, RefreshTokenTTL: time.Hour, RingTimeout: 30 * time.Second, Relay: true, Web: h.web,
 	}, log).Handler()
 	return h
+}
+
+func (h *harness) relayConfig() string {
+	h.t.Helper()
+	b, err := os.ReadFile(filepath.Join(h.relayDir, relay.FileName))
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return string(b)
 }
 
 // client はブラウザの代わり（Cookie と CSRF トークンを持つ）。
@@ -248,35 +260,146 @@ func TestDisabledUserCannotLogIn(t *testing.T) {
 	}
 }
 
-func TestAddPhoneAssignsLowestFreeExtensionWithinLimit(t *testing.T) {
+// setPBX は利用者の PBX を保存し、iPhone を追加できるようにする。
+func (c *client) setPBX(host string) {
+	c.h.t.Helper()
+	if rec := c.post("/pbx", url.Values{"host": {host}, "port": {"5060"}}); rec.Code != http.StatusSeeOther {
+		c.h.t.Fatalf("save pbx %s -> %d %s", host, rec.Code, rec.Body.String())
+	}
+}
+
+func (c *client) addPhone(label, ext, password string) *httptest.ResponseRecorder {
+	return c.post("/phones", url.Values{"label": {label}, "pbx_extension": {ext}, "password": {password}})
+}
+
+func (h *harness) phones(discordID string) []store.Extension {
+	h.t.Helper()
+	list, err := h.st.ListExtensionsByOwner(context.Background(), h.userByDiscord(discordID).ID)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return list
+}
+
+func TestPBXSettingIsValidated(t *testing.T) {
+	h := newHarness(t, nil)
+	c := h.browser()
+	c.login("alice")
+	if rec := c.addPhone("x", "201", "pw"); rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "PBX の設定") {
+		t.Fatalf("add before PBX -> %d", rec.Code)
+	}
+	for _, host := range []string{"192.168.1.10", "127.0.0.1", "pbx.example.com", "100.64.0.1\n[x]", ""} {
+		if rec := c.post("/pbx", url.Values{"host": {host}}); rec.Code != http.StatusBadRequest {
+			t.Fatalf("host %q -> %d", host, rec.Code)
+		}
+	}
+	if rec := c.post("/pbx", url.Values{"host": {"100.64.0.21"}, "port": {"70000"}}); rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad port -> %d", rec.Code)
+	}
+	c.setPBX("100.64.0.21")
+	if u := h.userByDiscord("alice"); u.PBXHost != "100.64.0.21" || u.PBXPort != 5060 {
+		t.Fatalf("pbx = %s:%d", u.PBXHost, u.PBXPort)
+	}
+	if h.syncs != 1 {
+		t.Fatalf("relay syncs = %d", h.syncs)
+	}
+}
+
+func TestEachUsersPhonesRegisterToTheirOwnPBX(t *testing.T) {
 	h := newHarness(t, nil)
 	alice, bob := h.browser(), h.browser()
 	alice.login("alice")
 	bob.login("bob")
-	for _, label := range []string{"仕事用", "私用"} {
-		if rec := alice.post("/phones", url.Values{"label": {label}}); rec.Code != http.StatusSeeOther {
-			t.Fatalf("add -> %d %s", rec.Code, rec.Body.String())
-		}
+	alice.setPBX("100.64.0.21")
+	bob.setPBX("100.64.0.22")
+	if rec := alice.addPhone("仕事用", "201", "alice-201"); rec.Code != http.StatusSeeOther {
+		t.Fatalf("add -> %d %s", rec.Code, rec.Body.String())
 	}
-	if rec := alice.post("/phones", nil); rec.Code != http.StatusConflict {
+	// 同じ内線を2台目に使うことはできない
+	if rec := alice.addPhone("重複", "201", "pw"); rec.Code != http.StatusConflict {
+		t.Fatalf("duplicate -> %d", rec.Code)
+	}
+	if rec := alice.addPhone("私用", "202", "alice-202"); rec.Code != http.StatusSeeOther {
+		t.Fatalf("add 2 -> %d", rec.Code)
+	}
+	if rec := alice.addPhone("3台目", "203", "pw"); rec.Code != http.StatusConflict {
 		t.Fatalf("over limit -> %d", rec.Code)
 	}
-	owned, _ := h.st.ListExtensionsByOwner(context.Background(), h.userByDiscord("alice").ID)
-	if len(owned) != 2 || owned[0].Number != "9101" || owned[1].Number != "9102" || owned[0].Label != "仕事用" {
-		t.Fatalf("owned = %+v", owned)
+	// 別の PBX に同じ内線番号 201 があってもよい
+	if rec := bob.addPhone("", "201", "bob-201"); rec.Code != http.StatusSeeOther {
+		t.Fatalf("bob add -> %d %s", rec.Code, rec.Body.String())
 	}
-	if rec := bob.post("/phones", nil); rec.Code != http.StatusSeeOther {
-		t.Fatalf("bob add -> %d", rec.Code)
+	a, b := h.phones("alice"), h.phones("bob")
+	if len(a) != 2 || len(b) != 1 || a[0].Number == b[0].Number || b[0].PBXExtension != "201" || b[0].Label != "iPhone" {
+		t.Fatalf("alice=%+v bob=%+v", a, b)
 	}
-	if e, _ := h.st.GetExtension(context.Background(), "9103"); e.OwnerUserID != h.userByDiscord("bob").ID || e.Label != "iPhone" {
-		t.Fatalf("9103 = %+v", e)
+	if pw, _ := h.box.Open(b[0].SIPPasswordEnc); pw != "bob-201" {
+		t.Fatal("password not stored")
 	}
-	// 割り当て用でない 9002 は使わない
-	if rec := bob.post("/phones", nil); rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "残っていません") {
-		t.Fatalf("no free -> %d", rec.Code)
+	cfg := h.relayConfig()
+	for _, want := range []string{
+		"server_uri=sip:100.64.0.21:5060\nclient_uri=sip:201@100.64.0.21",
+		"server_uri=sip:100.64.0.21:5060\nclient_uri=sip:202@100.64.0.21",
+		"server_uri=sip:100.64.0.22:5060\nclient_uri=sip:201@100.64.0.22",
+		"server_uri=sip:100.64.0.10:5060\nclient_uri=sip:9002@100.64.0.10", // 管理コマンドの内線は既定の PBX
+		"password=bob-201",
+		"set_var=MYVOIP_EXT=" + b[0].Number,
+	} {
+		if !strings.Contains(cfg, want) {
+			t.Errorf("relay config missing %q", want)
+		}
 	}
-	if h.syncs != 3 {
-		t.Fatalf("relay syncs = %d", h.syncs)
+	// PBX のアドレスを変えると登録先も変わる
+	bob.setPBX("100.64.0.23")
+	if cfg := h.relayConfig(); !strings.Contains(cfg, "client_uri=sip:201@100.64.0.23") || strings.Contains(cfg, "100.64.0.22") {
+		t.Fatal("relay config not updated for the new PBX")
+	}
+	// 画面には PBX での内線番号を出す
+	if page := alice.do(http.MethodGet, "/", nil).Body.String(); !strings.Contains(page, "内線 201") || !strings.Contains(page, "100.64.0.21:5060") {
+		t.Fatal("dashboard does not show the PBX and extension")
+	}
+}
+
+func TestPhoneInputIsValidated(t *testing.T) {
+	h := newHarness(t, nil)
+	c := h.browser()
+	c.login("alice")
+	c.setPBX("100.64.0.21")
+	for _, form := range []url.Values{
+		{"pbx_extension": {"20 1"}, "password": {"pw"}},
+		{"pbx_extension": {"201"}, "password": {"pw\n[evil]"}},
+		{"pbx_extension": {"201"}, "password": {""}},
+		{"pbx_extension": {"201"}, "sip_user": {"a;b"}, "password": {"pw"}},
+	} {
+		if rec := c.post("/phones", form); rec.Code != http.StatusBadRequest {
+			t.Fatalf("%v -> %d", form, rec.Code)
+		}
+	}
+	if len(h.phones("alice")) != 0 {
+		t.Fatal("invalid phone was saved")
+	}
+}
+
+func TestUpdateSIPKeepsPasswordWhenEmpty(t *testing.T) {
+	h := newHarness(t, nil)
+	c := h.browser()
+	c.login("alice")
+	c.setPBX("100.64.0.21")
+	c.addPhone("仕事用", "201", "old-pw")
+	line := h.phones("alice")[0].Number
+	if rec := c.post("/phones/"+line+"/sip", url.Values{"pbx_extension": {"301"}, "sip_user": {"301"}}); rec.Code != http.StatusSeeOther {
+		t.Fatalf("update -> %d %s", rec.Code, rec.Body.String())
+	}
+	e := h.phones("alice")[0]
+	if pw, _ := h.box.Open(e.SIPPasswordEnc); pw != "old-pw" || e.PBXExtension != "301" || e.SIPUsername != "301" || e.SIPAuthUsername != "301" {
+		t.Fatalf("after update: %+v pw=%s", e, pw)
+	}
+	c.post("/phones/"+line+"/sip", url.Values{"pbx_extension": {"301"}, "password": {"new-pw"}})
+	if pw, _ := h.box.Open(h.phones("alice")[0].SIPPasswordEnc); pw != "new-pw" {
+		t.Fatal("password not changed")
+	}
+	if !strings.Contains(h.relayConfig(), "password=new-pw") {
+		t.Fatal("relay config not updated")
 	}
 }
 
@@ -285,13 +408,15 @@ func TestCannotTouchOtherUsersPhone(t *testing.T) {
 	alice, bob := h.browser(), h.browser()
 	alice.login("alice")
 	bob.login("bob")
-	alice.post("/phones", nil)
-	for _, path := range []string{"/phones/9101/code", "/phones/9101/delete", "/phones/9101/rename", "/phones/9002/code"} {
-		if rec := bob.post(path, nil); rec.Code != http.StatusNotFound {
+	alice.setPBX("100.64.0.21")
+	alice.addPhone("仕事用", "201", "pw")
+	line := h.phones("alice")[0].Number
+	for _, path := range []string{"/phones/" + line + "/code", "/phones/" + line + "/delete", "/phones/" + line + "/rename", "/phones/" + line + "/sip", "/phones/9002/code"} {
+		if rec := bob.post(path, url.Values{"pbx_extension": {"999"}, "label": {"x"}}); rec.Code != http.StatusNotFound {
 			t.Fatalf("%s by other user -> %d", path, rec.Code)
 		}
 	}
-	if e, _ := h.st.GetExtension(context.Background(), "9101"); e.OwnerUserID != h.userByDiscord("alice").ID {
+	if e := h.phones("alice"); len(e) != 1 || e[0].PBXExtension != "201" || e[0].Label != "仕事用" {
 		t.Fatal("other user's action changed the phone")
 	}
 	// 管理者以外は管理画面を開けない
@@ -304,14 +429,14 @@ func TestPostWithoutCSRFIsRejected(t *testing.T) {
 	h := newHarness(t, nil)
 	c := h.browser()
 	c.login("alice")
-	if rec := c.do(http.MethodPost, "/phones", url.Values{"label": {"x"}}); rec.Code != http.StatusForbidden {
+	if rec := c.do(http.MethodPost, "/pbx", url.Values{"host": {"100.64.0.21"}}); rec.Code != http.StatusForbidden {
 		t.Fatalf("without csrf -> %d", rec.Code)
 	}
-	if rec := c.do(http.MethodPost, "/phones", url.Values{"csrf": {"wrong"}}); rec.Code != http.StatusForbidden {
+	if rec := c.do(http.MethodPost, "/pbx", url.Values{"csrf": {"wrong"}, "host": {"100.64.0.21"}}); rec.Code != http.StatusForbidden {
 		t.Fatalf("wrong csrf -> %d", rec.Code)
 	}
-	if owned, _ := h.st.ListExtensionsByOwner(context.Background(), h.userByDiscord("alice").ID); len(owned) != 0 {
-		t.Fatal("phone added without csrf")
+	if h.userByDiscord("alice").PBXHost != "" {
+		t.Fatal("saved without csrf")
 	}
 }
 
@@ -320,24 +445,29 @@ var (
 	enrollCodePattern = regexp.MustCompile(`class="copy-source code-input" readonly value="([0-9A-Z-]+)"`)
 )
 
-func TestEnrollmentCodeEnrollsAndDeleteRevokes(t *testing.T) {
+func TestEnrollmentCodeEnrollsAndDeleteRemoves(t *testing.T) {
 	h := newHarness(t, nil)
 	ctx := context.Background()
 	c := h.browser()
 	c.login("alice")
-	c.post("/phones", url.Values{"label": {"仕事用"}})
-	rec := c.post("/phones/9101/code", nil)
+	c.setPBX("100.64.0.21")
+	c.addPhone("仕事用", "201", "pbx-pw")
+	ext := h.phones("alice")[0]
+	rec := c.post("/phones/"+ext.Number+"/code", nil)
 	m := enrollCodePattern.FindStringSubmatch(rec.Body.String())
 	if rec.Code != http.StatusOK || m == nil || !strings.Contains(rec.Body.String(), "data:image/png;base64,") {
 		t.Fatalf("code page -> %d", rec.Code)
 	}
 
-	// アプリの登録 API で使える。中継モードなので中継用のパスワードが渡る
+	// アプリの登録 API で使える。iPhone は中継用 Asterisk にサーバーの識別子で登録し、画面には PBX の内線番号を出す
 	enroll := httptest.NewRequest(http.MethodPost, "/v1/enroll", strings.NewReader(`{"code":"`+m[1]+`","device_name":"iPhone","push_environment":"production"}`))
 	enroll.RemoteAddr = "127.0.0.1:50001"
 	er := httptest.NewRecorder()
 	h.api.ServeHTTP(er, enroll)
 	var resp struct {
+		Extension struct {
+			Number string `json:"number"`
+		} `json:"extension"`
 		SIP struct {
 			Username string `json:"username"`
 			Password string `json:"password"`
@@ -346,53 +476,40 @@ func TestEnrollmentCodeEnrollsAndDeleteRevokes(t *testing.T) {
 	if er.Code != http.StatusOK || json.Unmarshal(er.Body.Bytes(), &resp) != nil {
 		t.Fatalf("enroll -> %d %s", er.Code, er.Body.String())
 	}
-	before, _ := h.st.GetExtension(ctx, "9101")
-	if resp.SIP.Username != "9101" || resp.SIP.Password == "" {
-		t.Fatalf("sip = %+v", resp.SIP)
+	if resp.SIP.Username != ext.Number || resp.Extension.Number != "201" || resp.SIP.Password == "pbx-pw" {
+		t.Fatalf("enroll response = %+v", resp)
 	}
-	if mobile, _ := h.box.Open(before.MobilePasswordEnc); mobile != resp.SIP.Password {
+	if mobile, _ := h.box.Open(ext.MobilePasswordEnc); mobile != resp.SIP.Password {
 		t.Fatal("enroll did not return the relay password")
 	}
-	device, err := h.st.ActiveDeviceForExtension(ctx, "9101")
+	device, err := h.st.ActiveDeviceForExtension(ctx, ext.Number)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(c.do(http.MethodGet, "/", nil).Body.String(), "登録済み") {
 		t.Fatal("dashboard does not show the enrolled phone")
 	}
-	_ = h.st.AddHistory(ctx, store.HistoryItem{ID: "h1", Extension: "9101", Direction: "in", Result: "answered", StartedAt: time.Now()})
+	_ = h.st.AddHistory(ctx, store.HistoryItem{ID: "h1", Extension: ext.Number, Direction: "in", Result: "answered", StartedAt: time.Now()})
 
-	if rec := c.post("/phones/9101/delete", nil); rec.Code != http.StatusSeeOther {
+	if rec := c.post("/phones/"+ext.Number+"/delete", nil); rec.Code != http.StatusSeeOther {
 		t.Fatalf("delete -> %d", rec.Code)
 	}
-	if d, _ := h.st.GetDevice(ctx, device.ID); d.RevokedAt == nil {
-		t.Fatal("device not revoked")
+	if _, err := h.st.GetExtension(ctx, ext.Number); err == nil {
+		t.Fatal("extension not deleted")
 	}
-	after, _ := h.st.GetExtension(ctx, "9101")
-	if after.OwnerUserID != "" || after.Label != "" {
-		t.Fatalf("extension still assigned: %+v", after)
+	if _, err := h.st.GetDevice(ctx, device.ID); err == nil {
+		t.Fatal("device not deleted")
 	}
-	if mobile, _ := h.box.Open(after.MobilePasswordEnc); mobile == resp.SIP.Password {
-		t.Fatal("relay password not rotated")
+	if items, _ := h.st.ListHistory(ctx, ext.Number, 0, 10); len(items) != 0 {
+		t.Fatalf("history kept: %d", len(items))
 	}
-	if items, _ := h.st.ListHistory(ctx, "9101", 0, 10); len(items) != 0 {
-		t.Fatalf("history kept for the next user: %d", len(items))
-	}
-	// 次の利用者に割り当てても、前の利用者の端末・履歴は引き継がない
-	bob := h.browser()
-	bob.login("bob")
-	bob.post("/phones", nil)
-	if e, _ := h.st.GetExtension(ctx, "9101"); e.OwnerUserID != h.userByDiscord("bob").ID {
-		t.Fatalf("released extension not reused: %+v", e)
-	}
-	if _, err := h.st.ActiveDeviceForExtension(ctx, "9101"); err == nil {
-		t.Fatal("previous user's device is still active")
+	if strings.Contains(h.relayConfig(), ext.Number) {
+		t.Fatal("deleted phone is still in the relay config")
 	}
 }
 
 func TestSupportPasscodeLetsAdminOperate(t *testing.T) {
 	h := newHarness(t, nil)
-	ctx := context.Background()
 	alice, admin := h.browser(), h.browser()
 	alice.login("alice")
 	admin.login("admin")
@@ -414,17 +531,22 @@ func TestSupportPasscodeLetsAdminOperate(t *testing.T) {
 	if rec := admin.do(http.MethodGet, "/support", nil); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "Name alice") {
 		t.Fatalf("support dashboard -> %d", rec.Code)
 	}
-	if rec := admin.post("/support/phones", url.Values{"label": {"サポートで追加"}}); rec.Header().Get("Location") != "/support?m=added" {
+	// 管理者が利用者の PBX と iPhone を設定する
+	if rec := admin.post("/support/pbx", url.Values{"host": {"100.64.0.21"}}); rec.Header().Get("Location") != "/support?m=pbx_saved" {
+		t.Fatalf("support pbx -> %d %q", rec.Code, rec.Header().Get("Location"))
+	}
+	if rec := admin.post("/support/phones", url.Values{"label": {"サポートで追加"}, "pbx_extension": {"201"}, "password": {"pw"}}); rec.Header().Get("Location") != "/support?m=added" {
 		t.Fatalf("support add -> %d %q", rec.Code, rec.Header().Get("Location"))
 	}
-	aliceUser := h.userByDiscord("alice")
-	owned, _ := h.st.ListExtensionsByOwner(ctx, aliceUser.ID)
-	if len(owned) != 1 || owned[0].Label != "サポートで追加" {
+	if owned := h.phones("alice"); len(owned) != 1 || owned[0].Label != "サポートで追加" {
 		t.Fatalf("support add did not create alice's phone: %+v", owned)
+	}
+	if h.userByDiscord("admin").PBXHost != "" {
+		t.Fatal("support changed the admin's own PBX")
 	}
 	// 本人の画面に管理者の操作が記録される
 	page := alice.do(http.MethodGet, "/", nil).Body.String()
-	for _, want := range []string{"管理者がサポートを開始", "管理者（Name admin）", "iPhone を追加"} {
+	for _, want := range []string{"管理者がサポートを開始", "管理者（Name admin）", "iPhone を追加", "PBX の設定を変更"} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("audit missing %q", want)
 		}
@@ -461,6 +583,7 @@ func TestSupportPasscodeAttemptsAreLimited(t *testing.T) {
 
 func TestAdminAssignsExistingExtension(t *testing.T) {
 	h := newHarness(t, nil)
+	ctx := context.Background()
 	alice, admin := h.browser(), h.browser()
 	alice.login("alice")
 	admin.login("admin")
@@ -468,25 +591,27 @@ func TestAdminAssignsExistingExtension(t *testing.T) {
 	if rec := admin.post("/admin/extensions/9002/assign", url.Values{"user_id": {aliceID}, "label": {"既存"}}); rec.Code != http.StatusSeeOther {
 		t.Fatalf("assign -> %d %s", rec.Code, rec.Body.String())
 	}
-	if e, _ := h.st.GetExtension(context.Background(), "9002"); e.OwnerUserID != aliceID || e.Label != "既存" {
+	if e, _ := h.st.GetExtension(ctx, "9002"); e.OwnerUserID != aliceID || e.Label != "既存" {
 		t.Fatalf("9002 = %+v", e)
 	}
 	if rec := admin.do(http.MethodGet, "/admin", nil); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "Name alice・既存") {
 		t.Fatalf("admin page -> %d", rec.Code)
 	}
-	// 管理者が内線を追加する（割り当て用）
-	if rec := admin.post("/admin/extensions", url.Values{"number": {"9104"}, "password": {"pw"}, "pool": {"on"}}); rec.Code != http.StatusSeeOther {
-		t.Fatalf("save extension -> %d %s", rec.Code, rec.Body.String())
+	// 利用者が PBX を設定すると、割り当てた内線もその PBX へ登録する
+	alice.setPBX("100.64.0.21")
+	if !strings.Contains(h.relayConfig(), "client_uri=sip:9002@100.64.0.21") {
+		t.Fatal("assigned extension not moved to the user's PBX")
 	}
-	e, err := h.st.GetExtension(context.Background(), "9104")
-	if err != nil || !e.Pool || e.SIPUsername != "9104" {
-		t.Fatalf("9104 = %+v %v", e, err)
+	// 利用者が削除すると、管理コマンドの内線は消さずに割り当てだけを外す
+	if rec := alice.post("/phones/9002/delete", nil); rec.Code != http.StatusSeeOther {
+		t.Fatalf("delete -> %d", rec.Code)
 	}
-	if pw, _ := h.box.Open(e.SIPPasswordEnc); pw != "pw" {
-		t.Fatal("password not stored")
+	e, err := h.st.GetExtension(ctx, "9002")
+	if err != nil || e.OwnerUserID != "" {
+		t.Fatalf("9002 after delete = %+v %v", e, err)
 	}
-	if rec := admin.post("/admin/extensions", url.Values{"number": {"91;04"}, "password": {"pw"}}); rec.Code != http.StatusBadRequest {
-		t.Fatalf("invalid number -> %d", rec.Code)
+	if !strings.Contains(h.relayConfig(), "client_uri=sip:9002@100.64.0.10") {
+		t.Fatal("released extension not back on the default PBX")
 	}
 }
 

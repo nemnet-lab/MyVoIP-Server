@@ -194,6 +194,16 @@ type extensionJSON struct {
 	DisplayName string `json:"display_name,omitempty"`
 }
 
+// extensionInfo はアプリに表示する内線。利用者の PBX で作った内線は、その PBX での番号を返す
+// （サーバー内の識別子 Number は表示しない）。
+func extensionInfo(e store.Extension) extensionJSON {
+	number := e.PBXExtension
+	if number == "" {
+		number = e.Number
+	}
+	return extensionJSON{Number: number, DisplayName: e.DisplayName}
+}
+
 type tokenPair struct {
 	AccessToken  string `json:"access_token"`
 	ExpiresIn    int    `json:"expires_in"`
@@ -326,7 +336,7 @@ func (s *Server) enroll(w http.ResponseWriter, r *http.Request) {
 		"access_token":            tokens.AccessToken,
 		"access_token_expires_in": tokens.ExpiresIn,
 		"refresh_token":           tokens.RefreshToken,
-		"extension":               extensionJSON{Number: ext.Number, DisplayName: ext.DisplayName},
+		"extension":               extensionInfo(ext),
 		"sip":                     sip,
 		"policy":                  map[string]int{"ring_timeout_seconds": ring},
 	})
@@ -431,11 +441,14 @@ func (s *Server) setAvailability(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) deviceStatus(w http.ResponseWriter, r *http.Request) {
 	device := deviceFrom(r.Context())
-	ext, _ := s.store.GetExtension(r.Context(), device.Extension)
+	ext, err := s.store.GetExtension(r.Context(), device.Extension)
+	if err != nil {
+		ext = store.Extension{Number: device.Extension}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"enabled":               device.Enabled,
 		"voip_token_registered": device.VoIPToken != "",
-		"extension":             extensionJSON{Number: device.Extension, DisplayName: ext.DisplayName},
+		"extension":             extensionInfo(ext),
 		"server_time":           float64(time.Now().UnixMilli()) / 1000,
 	})
 }

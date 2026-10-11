@@ -102,6 +102,9 @@ h3 { font-size: 1rem; margin: 20px 0 8px; }
   color: var(--muted);
 }
 
+.tag.ok { color: var(--ok); border-color: var(--ok); }
+.tag.warn { color: var(--warn); border-color: var(--warn); }
+
 .phones { list-style: none; padding: 0; margin: 0 0 16px; }
 .phone { padding: 12px 0; border-bottom: 1px solid var(--border); }
 .phone:last-child { border-bottom: none; }
@@ -114,7 +117,8 @@ summary { cursor: pointer; color: var(--accent); padding: 6px 0; }
 form.inline { display: inline; margin: 0; }
 .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
 .row input { flex: 1 1 200px; min-width: 0; }
-.grid { display: grid; gap: 12px; max-width: 480px; }
+.grid { display: grid; gap: 12px; max-width: 480px; margin: 8px 0; }
+.grid details { margin: 0; }
 .grid label { display: grid; gap: 4px; font-size: 0.9rem; }
 .grid label.check { display: flex; align-items: center; gap: 8px; }
 

@@ -77,7 +77,7 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, `使い方:
   myvoip-server serve
-  myvoip-server extension set --number 201 [--display-name 名前] [--sip-user 201] [--auth-user 201] [--endpoint 201] [--ring-timeout 30] [--pool]
+  myvoip-server extension set --number 201 [--display-name 名前] [--sip-user 201] [--auth-user 201] [--endpoint 201] [--ring-timeout 30]
       （SIP パスワードは標準入力または環境変数 SIP_PASSWORD で渡す）
   myvoip-server extension list
   myvoip-server enroll-code --extension 201
@@ -150,11 +150,16 @@ func serve(log *slog.Logger) error {
 		var syncer web.Syncer
 		if cfg.RelayEnabled {
 			syncer = func(ctx context.Context) error {
-				return relay.Sync(ctx, db, box, relayOptions(cfg), cfg.RelayConfigDir, ariClient)
+				result, err := relay.Sync(ctx, db, box, relayOptions(cfg), cfg.RelayConfigDir, ariClient)
+				logSkipped(log, result)
+				return err
 			}
 		}
 		webServer, err := web.New(db, box, web.Config{
 			PublicURL: cfg.PublicURL, EnrollmentCodeTTL: cfg.EnrollmentCodeTTL, Relay: cfg.RelayEnabled, Web: cfg.Web,
+			EndpointState: func(ctx context.Context, resource string) (string, error) {
+				return ariClient.EndpointState(ctx, "PJSIP", resource)
+			},
 		}, syncer, log)
 		if err != nil {
 			return err
@@ -211,10 +216,11 @@ func syncRelayUntilDone(ctx context.Context, db store.Store, box *secret.Box, cf
 	delay := 2 * time.Second
 	for ctx.Err() == nil {
 		syncCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		err := relay.Sync(syncCtx, db, box, relayOptions(cfg), cfg.RelayConfigDir, reloader)
+		result, err := relay.Sync(syncCtx, db, box, relayOptions(cfg), cfg.RelayConfigDir, reloader)
 		cancel()
 		if err == nil {
-			log.Info("relay configuration applied", "upstream", fmt.Sprintf("%s:%d", cfg.UpstreamSIPHost, cfg.UpstreamSIPPort))
+			log.Info("relay configuration applied", "default_upstream", fmt.Sprintf("%s:%d", cfg.UpstreamSIPHost, cfg.UpstreamSIPPort))
+			logSkipped(log, result)
 			// エンドポイントができたので、登録先のイベントの購読をすぐ試す（失敗しても接続側で再試行する）
 			if client, ok := reloader.(*ari.Client); ok {
 				subCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -234,6 +240,13 @@ func syncRelayUntilDone(ctx context.Context, db store.Store, box *secret.Box, cf
 		if delay < 30*time.Second {
 			delay *= 2
 		}
+	}
+}
+
+// logSkipped は中継用 Asterisk に書けなかった内線を記録する（PBX 未設定など。ほかの内線は反映される）。
+func logSkipped(log *slog.Logger, result relay.Result) {
+	for _, reason := range result.Skipped {
+		log.Warn("relay: extension not registered to PBX", "reason", reason)
 	}
 }
 
@@ -261,10 +274,14 @@ func relaySync(ctx context.Context, cfg config.Config, db store.Store) error {
 	client := ari.New(cfg.ARIURL, cfg.ARIUser, cfg.ARIPassword, cfg.ARIApp, slog.Default())
 	syncCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	if err := relay.Sync(syncCtx, db, box, relayOptions(cfg), cfg.RelayConfigDir, client); err != nil {
+	result, err := relay.Sync(syncCtx, db, box, relayOptions(cfg), cfg.RelayConfigDir, client)
+	if err != nil {
 		return err
 	}
-	fmt.Printf("中継用 Asterisk の設定を反映しました（MikoPBX %s:%d へ登録）。\n", cfg.UpstreamSIPHost, cfg.UpstreamSIPPort)
+	fmt.Println("中継用 Asterisk の設定を反映しました。")
+	for _, reason := range result.Skipped {
+		fmt.Fprintln(os.Stderr, "警告: PBX へ登録しない内線があります:", reason)
+	}
 	return nil
 }
 
@@ -343,17 +360,23 @@ func extensionCmd(args []string) error {
 		for _, u := range users {
 			names[u.ID] = u.DisplayName
 		}
-		fmt.Printf("%-8s %-20s %-10s %-10s %-6s %-8s %s\n", "内線", "表示名", "SIPユーザー", "エンドポイント", "呼出秒", "割当用", "利用者")
-		for _, e := range list {
-			pool := "-"
-			if e.Pool {
-				pool = "はい"
+		pbx := map[string]string{}
+		for _, u := range users {
+			if u.PBXHost != "" {
+				pbx[u.ID] = fmt.Sprintf("%s:%d", u.PBXHost, u.PBXPort)
 			}
+		}
+		fmt.Printf("%-14s %-20s %-10s %-6s %-22s %s\n", "識別子", "表示名", "SIPユーザー", "呼出秒", "PBX", "利用者")
+		for _, e := range list {
 			owner := "-"
 			if e.OwnerUserID != "" {
 				owner = names[e.OwnerUserID] + "（" + e.Label + "）"
 			}
-			fmt.Printf("%-8s %-20s %-10s %-10s %-6d %-8s %s\n", e.Number, e.DisplayName, e.SIPUsername, e.Endpoint, e.RingTimeoutSeconds, pool, owner)
+			upstream := pbx[e.OwnerUserID]
+			if upstream == "" {
+				upstream = "既定（UPSTREAM_SIP_HOST）"
+			}
+			fmt.Printf("%-14s %-20s %-10s %-6d %-22s %s\n", e.Number, e.DisplayName, e.SIPUsername, e.RingTimeoutSeconds, upstream, owner)
 		}
 		return nil
 	case "set":
@@ -367,7 +390,6 @@ func extensionCmd(args []string) error {
 	authUser := fs.String("auth-user", "", "SIP 認証ユーザー名（省略時は SIP ユーザー名）")
 	endpoint := fs.String("endpoint", "", "端末レッグを発呼する PJSIP エンドポイント名（省略時は SIP ユーザー名）")
 	ring := fs.Int("ring-timeout", 30, "呼出秒数（15〜60）")
-	pool := fs.Bool("pool", false, "Web 管理画面で利用者に割り当てる内線にする")
 	_ = fs.Parse(args[1:])
 	if *number == "" {
 		return errors.New("--number is required")
@@ -413,15 +435,7 @@ func extensionCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	if *pool {
-		if err := db.SetExtensionPool(ctx, *number, true); err != nil {
-			return err
-		}
-	}
 	fmt.Printf("内線 %s を登録しました（SIP ユーザー %s、エンドポイント PJSIP/%s）。\n", *number, *sipUser, *endpoint)
-	if *pool {
-		fmt.Println("Web 管理画面で利用者に割り当てる内線にしました（割り当てるまで MikoPBX には登録しません）。")
-	}
 	if cfg.RelayEnabled {
 		// 中継用 Asterisk が MikoPBX にこの内線として登録するよう、設定を反映する
 		if err := relaySync(ctx, cfg, db); err != nil {

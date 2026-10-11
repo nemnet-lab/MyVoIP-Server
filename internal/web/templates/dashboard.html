@@ -1,6 +1,26 @@
 {{define "content"}}
 {{$csrf := .CSRF}}{{$base := .Data.Base}}
 <section class="card">
+  <h2>PBX の設定</h2>
+  <p>あなたの MikoPBX・Asterisk の SIP の接続先です。このサーバーは、ここに iPhone ごとの内線として登録します。</p>
+  {{if .Data.PBXHost}}
+  <p class="status ok">設定済み：{{.Data.PBXHost}}:{{.Data.PBXPort}}</p>
+  {{else}}
+  <p class="status warn">まだ設定していません。iPhone を追加する前に、PBX の Tailnet の IP アドレスを保存してください。</p>
+  {{end}}
+  <details {{if not .Data.PBXHost}}open{{end}}>
+    <summary>{{if .Data.PBXHost}}PBX の設定を変更{{else}}PBX を設定する{{end}}</summary>
+    <form method="post" action="{{$base}}/pbx" class="grid">
+      <input type="hidden" name="csrf" value="{{$csrf}}">
+      <label>IP アドレス（Tailnet）<input name="host" value="{{.Data.PBXHost}}" placeholder="100.64.0.10" required inputmode="decimal" autocomplete="off"></label>
+      <label>SIP のポート（UDP）<input name="port" value="{{if .Data.PBXPort}}{{.Data.PBXPort}}{{else}}5060{{end}}" inputmode="numeric" maxlength="5"></label>
+      <button class="primary">保存</button>
+    </form>
+    <p class="muted">PBX 側では、このサーバーからの登録（SIP の UDP）と音声（RTP）を受け付けるようにしてください。コーデックは G.711（alaw・ulaw）を使います。</p>
+  </details>
+</section>
+
+<section class="card">
   <h2>iPhone</h2>
   {{if .Data.Phones}}
   <ul class="phones">
@@ -8,7 +28,8 @@
     <li class="phone">
       <div class="phone-head">
         <strong>{{.Label}}</strong>
-        <span class="muted">内線 {{.Number}}{{if .DisplayName}}（{{.DisplayName}}）{{end}}</span>
+        <span class="muted">内線 {{.PBXExtension}}</span>
+        {{if eq .PBXState "online"}}<span class="tag ok">PBX に接続中</span>{{else if eq .PBXState "offline"}}<span class="tag warn">PBX に届きません</span>{{end}}
       </div>
       {{if .Enrolled}}
       <p class="status ok">登録済み：{{.DeviceName}}{{if .AppVersion}}（アプリ {{.AppVersion}}）{{end}}・{{datetime .EnrolledAt}}</p>
@@ -23,11 +44,19 @@
           <button class="primary">{{if .Enrolled}}登録コードを再発行（機種変更）{{else}}登録コードを発行{{end}}</button>
         </form>
         <details>
-          <summary>名前の変更・削除</summary>
+          <summary>設定の変更・削除</summary>
           <form method="post" action="{{$base}}/phones/{{.Number}}/rename" class="row">
             <input type="hidden" name="csrf" value="{{$csrf}}">
             <input name="label" value="{{.Label}}" maxlength="40" aria-label="名前">
             <button>名前を変更</button>
+          </form>
+          <form method="post" action="{{$base}}/phones/{{.Number}}/sip" class="grid">
+            <input type="hidden" name="csrf" value="{{$csrf}}">
+            <label>内線番号<input name="pbx_extension" value="{{.PBXExtension}}" required maxlength="40" autocomplete="off"></label>
+            <label>SIP ユーザー名<input name="sip_user" value="{{.SIPUser}}" maxlength="40" autocomplete="off"></label>
+            <label>認証ユーザー名<input name="auth_user" value="{{.AuthUser}}" maxlength="40" autocomplete="off"></label>
+            <label>SIP パスワード（変えるときだけ入力）<input name="password" type="password" autocomplete="new-password" maxlength="128"></label>
+            <button>内線の設定を保存</button>
           </form>
           <form method="post" action="{{$base}}/phones/{{.Number}}/delete" class="row" data-confirm="「{{.Label}}」を削除します。この iPhone のアプリは着信・発信できなくなります。よろしいですか？">
             <input type="hidden" name="csrf" value="{{$csrf}}">
@@ -39,20 +68,30 @@
     {{end}}
   </ul>
   {{else}}
-  <p>まだ iPhone がありません。下の「iPhone を追加」から作成してください。</p>
+  <p>まだ iPhone がありません。{{if .Data.PBXHost}}下の「iPhone を追加」から作成してください。{{end}}</p>
   {{end}}
 
-  {{if .Data.CanAdd}}
-    {{if .Data.NoFree}}
-    <p class="status warn">割り当てられる内線が残っていないため、いまは追加できません。管理者に依頼してください。</p>
-    {{else}}
-    <form method="post" action="{{$base}}/phones" class="row add">
+  {{if not .Data.PBXHost}}
+  <p class="muted">iPhone を追加するには、先に PBX を設定してください。</p>
+  {{else if .Data.CanAdd}}
+  <details {{if not .Data.Phones}}open{{end}}>
+    <summary>iPhone を追加</summary>
+    <p class="muted">あなたの PBX で、この iPhone 用の内線を先に作成してください（1つの内線で使える iPhone は1台です）。{{.Data.Max}} 台まで追加できます。</p>
+    <form method="post" action="{{$base}}/phones" class="grid">
       <input type="hidden" name="csrf" value="{{$csrf}}">
-      <input name="label" placeholder="名前（例：仕事用 iPhone）" maxlength="40" aria-label="名前">
+      <label>名前<input name="label" placeholder="例：仕事用 iPhone" maxlength="40"></label>
+      <label>内線番号<input name="pbx_extension" required maxlength="40" inputmode="numeric" autocomplete="off"></label>
+      <label>SIP パスワード（PBX の内線設定の値）<input name="password" type="password" required autocomplete="new-password" maxlength="128"></label>
+      <details>
+        <summary>SIP ユーザー名が内線番号と違う場合</summary>
+        <div class="grid">
+          <label>SIP ユーザー名（省略時は内線番号）<input name="sip_user" maxlength="40" autocomplete="off"></label>
+          <label>認証ユーザー名（省略時は SIP ユーザー名）<input name="auth_user" maxlength="40" autocomplete="off"></label>
+        </div>
+      </details>
       <button class="primary">iPhone を追加</button>
     </form>
-    <p class="muted">1台につき内線がひとつ割り当てられます（{{.Data.Max}} 台まで）。</p>
-    {{end}}
+  </details>
   {{else}}
   <p class="muted">iPhone は {{.Data.Max}} 台まで作成できます。</p>
   {{end}}
@@ -86,6 +125,7 @@
 {{if .Data.Audit}}
 <section class="card">
   <h2>操作の記録</h2>
+  <div class="scroll">
   <table class="list">
     <thead><tr><th>日時</th><th>操作した人</th><th>内容</th></tr></thead>
     <tbody>
@@ -94,6 +134,7 @@
     {{end}}
     </tbody>
   </table>
+  </div>
 </section>
 {{end}}
 {{end}}

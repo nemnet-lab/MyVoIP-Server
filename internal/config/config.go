@@ -49,7 +49,8 @@ type Config struct {
 	RelayEnabled bool
 	// RelayConfigDir は中継用 Asterisk の設定（pjsip_myvoip.conf）を書き出すディレクトリ
 	RelayConfigDir string
-	// UpstreamSIPHost / Port は MikoPBX の SIP の接続先（中継用 Asterisk から見たアドレス）
+	// UpstreamSIPHost / Port は既定の PBX の SIP の接続先（中継用 Asterisk から見たアドレス）。
+	// 管理コマンドで登録した内線と、PBX を設定していない利用者の内線の登録先。利用者が自分の PBX を設定するなら空でもよい
 	UpstreamSIPHost string
 	UpstreamSIPPort int
 	// APNSEndpoint は APNs の送信先の上書き（試験用。通常は空）
@@ -74,6 +75,9 @@ type WebConfig struct {
 	AllowedUserIDs []string
 	// AdminIDs は管理者の Discord ユーザー ID（常にログインでき、管理画面を使える）
 	AdminIDs []string
+	// AllowedPBX は利用者が設定できる PBX のアドレス帯（MYVOIP_ALLOWED_PBX_CIDRS。既定は Tailnet）。
+	// 利用者が入力したアドレスにこのサーバーから SIP を送るため、意図しない宛先（LAN 内の機器など）を防ぐ
+	AllowedPBX []netip.Prefix
 	// MaxPhonesPerUser は利用者1人が作成できる iPhone（内線）の上限
 	MaxPhonesPerUser int
 	SessionTTL       time.Duration
@@ -201,7 +205,6 @@ func Load(requireRuntime bool) (Config, error) {
 		errs = append(errs, "SIP_SRTP must be optional, mandatory or disabled")
 	}
 	if c.RelayEnabled {
-		need("UPSTREAM_SIP_HOST", c.UpstreamSIPHost)
 		if c.SIPTransport != "udp" {
 			errs = append(errs, "relay mode supports SIP_TRANSPORT=udp only")
 		}
@@ -216,6 +219,14 @@ func Load(requireRuntime bool) (Config, error) {
 		if _, err := os.Stat(c.APNSKeyFile); err != nil {
 			errs = append(errs, fmt.Sprintf("APNs key file not readable: %s", c.APNSKeyFile))
 		}
+	}
+	for _, raw := range list(env("MYVOIP_ALLOWED_PBX_CIDRS", "100.64.0.0/10,fd7a:115c:a1e0::/48")) {
+		prefix, err := netip.ParsePrefix(raw)
+		if err != nil {
+			errs = append(errs, "MYVOIP_ALLOWED_PBX_CIDRS has an invalid CIDR: "+raw)
+			continue
+		}
+		c.Web.AllowedPBX = append(c.Web.AllowedPBX, prefix.Masked())
 	}
 	if c.Web.Enabled {
 		need("DISCORD_CLIENT_SECRET", c.Web.DiscordClientSecret)

@@ -72,4 +72,21 @@ func TestWebConsoleSettings(t *testing.T) {
 	if err != nil || !c.Web.Enabled || len(c.Web.AdminIDs) != 2 || c.Web.AdminIDs[1] != "222" || c.Web.MaxPhonesPerUser != 3 {
 		t.Fatalf("%v %+v", err, c.Web)
 	}
+	// 利用者が設定できる PBX は、既定で Tailnet のアドレス帯だけ
+	if len(c.Web.AllowedPBX) != 2 || c.Web.AllowedPBX[0].String() != "100.64.0.0/10" {
+		t.Fatalf("AllowedPBX = %v", c.Web.AllowedPBX)
+	}
+	t.Setenv("MYVOIP_ALLOWED_PBX_CIDRS", "100.64.0.0")
+	if _, err := Load(false); err == nil {
+		t.Fatal("invalid PBX CIDR accepted")
+	}
+}
+
+func TestRelayWithoutDefaultPBX(t *testing.T) {
+	base(t)
+	t.Setenv("RELAY_ENABLED", "true")
+	// 利用者がそれぞれ自分の PBX を設定する構成では、既定の PBX はなくてもよい
+	if _, err := Load(false); err != nil {
+		t.Fatal(err)
+	}
 }

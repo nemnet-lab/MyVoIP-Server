@@ -4,12 +4,15 @@
 // MikoPBX から見ると、その内線は常に online の通常の端末になり、画面で設定した着信ルートがそのまま使える。
 // iPhone は MikoPBX ではなく中継用 Asterisk に登録し、着信は Stasis（呼制御）を通して Push で起こしてからつなぐ。
 // iPhone からの発信は、中継用 Asterisk が MikoPBX へその内線からの発信として送る。
+//
+// 利用者ごとに自分の PBX（MikoPBX・Asterisk）を持つ構成では、内線ごとに持ち主の PBX へ登録する。
 package relay
 
 import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net/netip"
 	"os"
@@ -26,15 +29,45 @@ import (
 const FileName = "pjsip_myvoip.conf"
 
 type Options struct {
+	// UpstreamHost / Port は既定の PBX（持ち主のいない内線と、PBX を設定していない利用者の内線の登録先）
 	UpstreamHost string
 	UpstreamPort int
+	// UserPBX は利用者ごとの PBX（利用者 ID → 接続先）
+	UserPBX map[string]Upstream
 	// AllowedClients は iPhone 用エンドポイントに SIP で接続できるアドレス帯（空なら制限しない）
 	AllowedClients []netip.Prefix
 	// SRTP は optional / mandatory / disabled（mandatory のときだけ iPhone 側を sdes にする）
 	SRTP string
 }
 
-var safeName = regexp.MustCompile(`^[0-9A-Za-z_.+-]+$`)
+// Upstream は中継用 Asterisk が登録する PBX の SIP の接続先。
+type Upstream struct {
+	Host string
+	Port int
+}
+
+// upstreamFor は内線の登録先を返す。利用者の PBX があればそちら、なければ既定の PBX。
+func (o Options) upstreamFor(e store.Extension) (Upstream, bool) {
+	if e.OwnerUserID != "" {
+		if u, ok := o.UserPBX[e.OwnerUserID]; ok && u.Host != "" {
+			return u, true
+		}
+	}
+	if o.UpstreamHost != "" {
+		return Upstream{Host: o.UpstreamHost, Port: o.UpstreamPort}, true
+	}
+	return Upstream{}, false
+}
+
+var (
+	safeName = regexp.MustCompile(`^[0-9A-Za-z_.+-]+$`)
+	safeHost = regexp.MustCompile(`^[0-9A-Za-z.:-]+$`)
+)
+
+// validUpstream は設定ファイルにそのまま書いてよい接続先かを確かめる。
+func validUpstream(u Upstream) bool {
+	return safeHost.MatchString(u.Host) && !strings.HasPrefix(u.Host, "-") && u.Port > 0 && u.Port < 65536
+}
 
 // UpstreamEndpoint は MikoPBX 側のエンドポイント名（iPhone からの発信の宛先）。
 func UpstreamEndpoint(number string) string { return "myvoip-up-" + number }
@@ -66,65 +99,93 @@ func NewPassword() string {
 }
 
 // Render は内線一覧から pjsip の設定を作る。
+// 登録先の PBX がない・設定に使えない文字があるなどの内線は書かずに、理由を skipped に入れる（ほかの内線は止めない）。
 // コーデックは MikoPBX の既定（PCMA 優先）に合わせて alaw,ulaw の順にし、両側で同じコーデックになるようにする。
-func Render(exts []store.Extension, box *secret.Box, opts Options) (string, error) {
+func Render(exts []store.Extension, box *secret.Box, opts Options) (content string, skipped []string) {
 	sort.Slice(exts, func(i, j int) bool { return exts[i].Number < exts[j].Number })
 	var b strings.Builder
 	b.WriteString("; MyVoIP-Server が生成する設定です。手で編集しないでください（extension set や relay sync で上書きされます）。\n")
 	for _, e := range exts {
-		if !safeName.MatchString(e.Number) || !safeName.MatchString(e.SIPUsername) {
-			return "", fmt.Errorf("extension %q has characters that cannot be used in the relay configuration", e.Number)
-		}
-		upstreamPassword, err := box.Open(e.SIPPasswordEnc)
-		if err != nil {
-			return "", fmt.Errorf("extension %s: %w", e.Number, err)
-		}
-		if len(e.MobilePasswordEnc) == 0 {
-			return "", fmt.Errorf("extension %s has no mobile password", e.Number)
-		}
-		mobilePassword, err := box.Open(e.MobilePasswordEnc)
-		if err != nil {
-			return "", fmt.Errorf("extension %s: %w", e.Number, err)
-		}
-		authUser := e.SIPAuthUsername
-		if authUser == "" {
-			authUser = e.SIPUsername
-		}
-		up := UpstreamEndpoint(e.Number)
-		server := fmt.Sprintf("sip:%s:%d", opts.UpstreamHost, opts.UpstreamPort)
-
-		fmt.Fprintf(&b, "\n; ===== 内線 %s：MikoPBX への登録（MikoPBX から見た内線 %s） =====\n", e.Number, e.SIPUsername)
-		fmt.Fprintf(&b, "[%s-auth]\ntype=auth\nauth_type=userpass\nusername=%s\npassword=%s\n\n", up, authUser, escape(upstreamPassword))
-		fmt.Fprintf(&b, "[%s]\ntype=aor\ncontact=%s\n\n", up, server)
-		fmt.Fprintf(&b, "[%s]\ntype=endpoint\ntransport=transport-udp\ncontext=from-pbx\ndisallow=all\nallow=alaw,ulaw\n"+
-			"outbound_auth=%s-auth\naors=%s\nfrom_user=%s\nfrom_domain=%s\ndirect_media=no\nrtp_symmetric=yes\n"+
-			"force_rport=yes\nrewrite_contact=yes\ndtmf_mode=rfc4733\nset_var=MYVOIP_EXT=%s\n\n",
-			up, up, up, e.SIPUsername, opts.UpstreamHost, e.Number)
-		fmt.Fprintf(&b, "[%s]\ntype=registration\ntransport=transport-udp\noutbound_auth=%s-auth\nserver_uri=%s\n"+
-			"client_uri=sip:%s@%s\ncontact_user=%s\nexpiration=300\nretry_interval=30\nforbidden_retry_interval=120\n"+
-			"fatal_retry_interval=120\nmax_retries=1000000\nauth_rejection_permanent=no\nline=yes\nendpoint=%s\n",
-			up, up, server, e.SIPUsername, opts.UpstreamHost, e.SIPUsername, up)
-
-		fmt.Fprintf(&b, "\n; ===== 内線 %s：iPhone の登録先 =====\n", e.Number)
-		fmt.Fprintf(&b, "[%s]\ntype=auth\nauth_type=userpass\nusername=%s\npassword=%s\n\n", e.Number, e.Number, escape(mobilePassword))
-		// アプリは接続のたびに新しい Contact で登録するので複数を許す。生存確認（OPTIONS）は不要
-		fmt.Fprintf(&b, "[%s]\ntype=aor\nmax_contacts=5\nremove_existing=no\nqualify_frequency=0\nminimum_expiration=60\ndefault_expiration=300\n\n", e.Number)
-		encryption := "no"
-		if opts.SRTP == "mandatory" {
-			encryption = "sdes"
-		}
-		fmt.Fprintf(&b, "[%s]\ntype=endpoint\ntransport=transport-udp\ncontext=from-mobile\ndisallow=all\nallow=alaw,ulaw\n"+
-			"auth=%s\naors=%s\ndirect_media=no\nrtp_symmetric=yes\nforce_rport=yes\nrewrite_contact=yes\n"+
-			"dtmf_mode=rfc4733\nmedia_encryption=%s\nset_var=MYVOIP_EXT=%s\n",
-			e.Number, e.Number, e.Number, encryption, e.Number)
-		if len(opts.AllowedClients) > 0 {
-			b.WriteString("deny=0.0.0.0/0.0.0.0\ndeny=::/0\n")
-			for _, p := range opts.AllowedClients {
-				fmt.Fprintf(&b, "permit=%s\n", p.String())
-			}
+		if err := renderExtension(&b, e, box, opts); err != nil {
+			skipped = append(skipped, fmt.Sprintf("extension %s: %v", e.Number, err))
 		}
 	}
-	return b.String(), nil
+	return b.String(), skipped
+}
+
+func renderExtension(out *strings.Builder, e store.Extension, box *secret.Box, opts Options) error {
+	authUser := e.SIPAuthUsername
+	if authUser == "" {
+		authUser = e.SIPUsername
+	}
+	if !safeName.MatchString(e.Number) || !safeName.MatchString(e.SIPUsername) || !safeName.MatchString(authUser) {
+		return errors.New("has characters that cannot be used in the relay configuration")
+	}
+	upstream, ok := opts.upstreamFor(e)
+	if !ok {
+		return errors.New("no PBX to register to (set the user's PBX or UPSTREAM_SIP_HOST)")
+	}
+	if !validUpstream(upstream) {
+		return fmt.Errorf("invalid PBX address %q", upstream.Host)
+	}
+	upstreamPassword, err := box.Open(e.SIPPasswordEnc)
+	if err != nil {
+		return err
+	}
+	if len(e.MobilePasswordEnc) == 0 {
+		return errors.New("has no mobile password")
+	}
+	mobilePassword, err := box.Open(e.MobilePasswordEnc)
+	if err != nil {
+		return err
+	}
+	if !safeValue(upstreamPassword) || !safeValue(mobilePassword) {
+		return errors.New("password has control characters")
+	}
+	host := upstream.Host
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]" // IPv6
+	}
+	up := UpstreamEndpoint(e.Number)
+	server := fmt.Sprintf("sip:%s:%d", host, upstream.Port)
+
+	// 一時的に組み立ててから書く（途中で失敗した内線を半端に書かない）
+	var b strings.Builder
+	fmt.Fprintf(&b, "\n; ===== 内線 %s：PBX %s への登録（PBX から見た内線 %s） =====\n", e.Number, upstream.Host, e.SIPUsername)
+	fmt.Fprintf(&b, "[%s-auth]\ntype=auth\nauth_type=userpass\nusername=%s\npassword=%s\n\n", up, authUser, escape(upstreamPassword))
+	// PBX への生存確認（OPTIONS）で、PBX に届くかを把握し、経路（Tailscale の通信の状態）を保つ
+	fmt.Fprintf(&b, "[%s]\ntype=aor\ncontact=%s\nqualify_frequency=30\nqualify_timeout=5\n\n", up, server)
+	// PBX からの INVITE は、登録の line パラメーターだけで見分ける（identify_by=ip で、From のユーザー名では一致させない。
+	// 認証なしのエンドポイントなので、ほかの利用者がユーザー名をまねて着信させられないようにする）
+	fmt.Fprintf(&b, "[%s]\ntype=endpoint\ntransport=transport-udp\ncontext=from-pbx\ndisallow=all\nallow=alaw,ulaw\n"+
+		"outbound_auth=%s-auth\naors=%s\nfrom_user=%s\nfrom_domain=%s\ndirect_media=no\nrtp_symmetric=yes\n"+
+		"force_rport=yes\nrewrite_contact=yes\ndtmf_mode=rfc4733\nidentify_by=ip\nset_var=MYVOIP_EXT=%s\n\n",
+		up, up, up, e.SIPUsername, upstream.Host, e.Number)
+	fmt.Fprintf(&b, "[%s]\ntype=registration\ntransport=transport-udp\noutbound_auth=%s-auth\nserver_uri=%s\n"+
+		"client_uri=sip:%s@%s\ncontact_user=%s\nexpiration=300\nretry_interval=30\nforbidden_retry_interval=120\n"+
+		"fatal_retry_interval=120\nmax_retries=1000000\nauth_rejection_permanent=no\nline=yes\nendpoint=%s\n",
+		up, up, server, e.SIPUsername, host, e.SIPUsername, up)
+
+	fmt.Fprintf(&b, "\n; ===== 内線 %s：iPhone の登録先 =====\n", e.Number)
+	fmt.Fprintf(&b, "[%s]\ntype=auth\nauth_type=userpass\nusername=%s\npassword=%s\n\n", e.Number, e.Number, escape(mobilePassword))
+	// アプリは接続のたびに新しい Contact で登録するので複数を許す。生存確認（OPTIONS）は不要
+	fmt.Fprintf(&b, "[%s]\ntype=aor\nmax_contacts=5\nremove_existing=no\nqualify_frequency=0\nminimum_expiration=60\ndefault_expiration=300\n\n", e.Number)
+	encryption := "no"
+	if opts.SRTP == "mandatory" {
+		encryption = "sdes"
+	}
+	fmt.Fprintf(&b, "[%s]\ntype=endpoint\ntransport=transport-udp\ncontext=from-mobile\ndisallow=all\nallow=alaw,ulaw\n"+
+		"auth=%s\naors=%s\ndirect_media=no\nrtp_symmetric=yes\nforce_rport=yes\nrewrite_contact=yes\n"+
+		"dtmf_mode=rfc4733\nmedia_encryption=%s\nset_var=MYVOIP_EXT=%s\n",
+		e.Number, e.Number, e.Number, encryption, e.Number)
+	if len(opts.AllowedClients) > 0 {
+		b.WriteString("deny=0.0.0.0/0.0.0.0\ndeny=::/0\n")
+		for _, p := range opts.AllowedClients {
+			fmt.Fprintf(&b, "permit=%s\n", p.String())
+		}
+	}
+	out.WriteString(b.String())
+	return nil
 }
 
 // escape は pjsip.conf の値として使えるようにする（; はコメント扱いになるため）。
@@ -132,16 +193,14 @@ func escape(s string) string {
 	return strings.ReplaceAll(s, ";", `\;`)
 }
 
-// InUse は MikoPBX に登録する内線を返す。
-// 利用者に割り当てる予備の内線（pool）は、割り当てるまで登録しない（MikoPBX から見て offline のまま）。
-func InUse(exts []store.Extension) []store.Extension {
-	var list []store.Extension
-	for _, e := range exts {
-		if !e.Pool || e.OwnerUserID != "" {
-			list = append(list, e)
+// safeValue は改行などの制御文字を含まない（設定ファイルの行を壊さない）ことを確かめる。
+func safeValue(s string) bool {
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return false
 		}
 	}
-	return list
+	return true
 }
 
 // Write は設定ファイルを置き換える（途中の状態を Asterisk に読ませない）。
@@ -173,30 +232,44 @@ type Reloader interface {
 	ReloadModule(ctx context.Context, name string) error
 }
 
+// Result は Sync の結果。
+type Result struct {
+	// Skipped は書かなかった内線と理由
+	Skipped []string
+}
+
 // Sync は内線一覧から設定を書き出し、Asterisk に読み込ませる。
-func Sync(ctx context.Context, st store.Store, box *secret.Box, opts Options, dir string, reloader Reloader) error {
+func Sync(ctx context.Context, st store.Store, box *secret.Box, opts Options, dir string, reloader Reloader) (Result, error) {
 	if err := EnsureMobilePasswords(ctx, st, box); err != nil {
-		return err
+		return Result{}, err
 	}
 	exts, err := st.ListExtensions(ctx)
 	if err != nil {
-		return err
+		return Result{}, err
 	}
-	content, err := Render(InUse(exts), box, opts)
+	users, err := st.ListUsers(ctx)
 	if err != nil {
-		return err
+		return Result{}, err
 	}
+	opts.UserPBX = map[string]Upstream{}
+	for _, u := range users {
+		if u.PBXHost != "" {
+			opts.UserPBX[u.ID] = Upstream{Host: u.PBXHost, Port: u.PBXPort}
+		}
+	}
+	content, skipped := Render(exts, box, opts)
+	result := Result{Skipped: skipped}
 	if err := Write(dir, content); err != nil {
-		return err
+		return result, err
 	}
 	if reloader == nil {
-		return nil
+		return result, nil
 	}
 	if err := reloader.ReloadModule(ctx, "res_pjsip.so"); err != nil {
-		return fmt.Errorf("reload res_pjsip: %w", err)
+		return result, fmt.Errorf("reload res_pjsip: %w", err)
 	}
 	if err := reloader.ReloadModule(ctx, "res_pjsip_outbound_registration.so"); err != nil {
-		return fmt.Errorf("reload res_pjsip_outbound_registration: %w", err)
+		return result, fmt.Errorf("reload res_pjsip_outbound_registration: %w", err)
 	}
-	return nil
+	return result, nil
 }

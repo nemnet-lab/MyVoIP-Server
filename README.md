@@ -4,7 +4,7 @@
 
 - MikoPBX（Asterisk）の ARI で着信を保持し、APNs の VoIP Push で iPhone を起こしてからつなぐ
 - アプリ用の HTTP(S) API（[docs/api.md](docs/api.md)）と管理コマンド（内線登録・登録コード発行・端末管理）
-- Discord でログインする Web 管理画面（利用者が自分の iPhone を作成して登録コードを発行する・サポート用パスコード）
+- Discord でログインする Web 管理画面（利用者がそれぞれ自分の PBX を設定し、iPhone を作成して登録コードを発行する・サポート用パスコード）
 - リバースプロキシは Caddy か Nginx を選べる
 
 iPhone アプリ本体は別リポジトリ（非公開）です。
@@ -88,7 +88,7 @@ docker compose logs -f myvoip   # "ARI events connected" が出れば MikoPBX �
 |---|---|---|
 | `COMPOSE_PROFILES` | `caddy,relay` | `relay` を加えると中継用 Asterisk が起動する |
 | `RELAY_ENABLED` | `true` | 中継モードにする |
-| `UPSTREAM_SIP_HOST` / `UPSTREAM_SIP_PORT` | `100.64.0.10` / `5060` | MikoPBX の SIP の接続先（このサーバーから見たアドレス） |
+| `UPSTREAM_SIP_HOST` / `UPSTREAM_SIP_PORT` | `100.64.0.10` / `5060` | 既定の PBX の SIP の接続先（このサーバーから見たアドレス）。管理コマンドで登録した内線の登録先。Web 管理画面で利用者が自分の PBX を設定するなら空でもよい |
 | `SIP_DOMAIN` | `100.64.0.20` | **このサーバー**のアドレス（iPhone から届くもの）。iPhone はここに登録する |
 | `ARI_URL` | `http://10.211.0.1:8088/ari` | 中継用 Asterisk の ARI（`MYVOIP_DOCKER_GATEWAY` のアドレス） |
 | `ARI_USER` / `ARI_PASSWORD` | `myvoip` / 任意の長い文字列 | 中継用 Asterisk の ARI ユーザー（MikoPBX の ARI とは無関係） |
@@ -168,16 +168,41 @@ docker compose exec myvoip myvoip-server enroll-code --extension 201
 
 ### Web 管理画面（Discord でログイン）
 
-複数の利用者に使ってもらう場合は、Web 管理画面を有効にすると、利用者が自分で iPhone を作成して登録コードを発行できます。画面は API と同じアドレス（`MYVOIP_PUBLIC_URL`）で開き、`MYVOIP_ALLOWED_CLIENT_CIDRS` の制限も同じく受けます。
+このサーバー（Apple の VoIP Push の証明書を持つサーバー）を複数の人で共用し、**利用者はそれぞれ自分の MikoPBX・Asterisk を持つ**構成のための画面です。利用者は自分で PBX の接続先を設定し、iPhone を作成して登録コードを発行します。中継用 Asterisk は、iPhone ごとの内線として、その利用者の PBX に登録します。
+
+```
+利用者 A の iPhone ─┐                     ┌─内線として登録─▶ 利用者 A の PBX（100.x.y.a）
+利用者 B の iPhone ─┼─▶ このサーバー（共用）─┼─内線として登録─▶ 利用者 B の PBX（100.x.y.b）
+                    └── VoIP Push（Apple） └─ …
+```
+
+画面は API と同じアドレス（`MYVOIP_PUBLIC_URL`）で開き、`MYVOIP_ALLOWED_CLIENT_CIDRS` の制限も同じく受けます。
 
 | 利用者ができること | 内容 |
 |---|---|
-| iPhone を追加 | 「割り当て用」の空き内線を、番号の小さい順に1台につき1つ割り当てる（1内線につき iPhone 1台）。上限は `MYVOIP_MAX_PHONES_PER_USER`（既定 3） |
+| PBX の設定 | 自分の PBX の SIP の接続先（Tailnet の IP アドレスとポート）。`MYVOIP_ALLOWED_PBX_CIDRS`（既定は Tailnet の `100.64.0.0/10` と `fd7a:115c:a1e0::/48`）の IP アドレスだけを受け付ける |
+| iPhone を追加 | 自分の PBX で作った内線の番号と SIP パスワード（必要なら SIP ユーザー名・認証ユーザー名）を入力する。1つの内線で使える iPhone は1台。上限は `MYVOIP_MAX_PHONES_PER_USER`（既定 3） |
 | 登録コードを発行 | アプリに入力する設定 URL・登録コード（10分・1回限り）と QR を表示する。機種変更のときも再発行する |
-| iPhone を削除 | 端末を失効し、その内線の履歴を消して割り当てを外す。中継モードでは中継用のパスワードも作り直す |
-| サポート用パスコード | 数字8桁（`SUPPORT_PASSCODE_MINUTES`、既定30分・1回限り）。管理者に伝えると、管理者が `SUPPORT_SESSION_MINUTES`（既定60分）だけ利用者の画面を開いて操作できる。管理者の操作は利用者の画面の「操作の記録」に表示される |
+| 内線の設定の変更・削除 | SIP の設定の変更（パスワードは変えるときだけ入力）。削除すると端末・履歴・登録コードも消え、PBX への登録もやめる |
+| PBX への接続状態 | 中継用 Asterisk から PBX に届いているか（30秒ごとの OPTIONS）を iPhone ごとに表示する |
+| サポート用パスコード | 数字8桁（`SUPPORT_PASSCODE_MINUTES`、既定30分・1回限り）。管理者に伝えると、管理者が `SUPPORT_SESSION_MINUTES`（既定60分）だけ利用者の画面を開いて、PBX や iPhone の設定を代わりに操作できる。管理者の操作は利用者の画面の「操作の記録」に表示される |
 
-管理者（`MYVOIP_ADMIN_DISCORD_IDS`）は「管理」画面で、サポートの開始、内線の追加・「割り当て用」の切り替え・割り当て・解除、利用者のログイン停止ができます。
+管理者（`MYVOIP_ADMIN_DISCORD_IDS`）は「管理」画面で、サポートの開始、利用者のログイン停止、管理コマンドで登録した内線（例 9002）の利用者への割り当て・解除ができます。
+
+- 別々の PBX に同じ内線番号（例 201）があっても使えます。サーバーは内線ごとに `mv` で始まる識別子を振り、中継用 Asterisk のエンドポイント名と iPhone の SIP ユーザー名に使います。アプリには PBX での内線番号を表示します。
+- PBX からの着信は、登録時の `line` パラメーターだけでどの内線かを見分けます（PBX 側のエンドポイントは `identify_by=ip`）。ほかの利用者が SIP のユーザー名をまねて、別の利用者の iPhone に着信させることはできません。
+- 1人の利用者の設定に誤りがあっても、ほかの利用者の内線は登録されます（その内線だけを書かずに、ログに `relay: extension not registered to PBX` を出します）。
+
+**利用者の PBX に必要な設定**
+
+- このサーバーの Tailnet のアドレスからの SIP（UDP、既定 5060）の登録と、音声（RTP。中継用 Asterisk の `RELAY_RTP_START`〜`RELAY_RTP_END`）を受け付ける。MikoPBX はファイアウォールや「信頼するネットワーク」の設定を確認する。
+- コーデックに G.711（alaw・ulaw）を含める。
+- PBX が LAN にある場合、Tailnet の相手に対して SIP の Contact や SDP の音声アドレスに Tailnet のアドレスを使うようにする（[Tailscale だけで使う構成](#tailscaletailnetだけで使う構成)の「MikoPBX 側の注意」と同じ）。
+
+**Tailnet の構成**
+
+- このサーバー・利用者の PBX・利用者の iPhone が同じ tailnet にいれば、追加の設定は要りません（ACL で、iPhone → このサーバーの HTTP と SIP・RTP、このサーバー ↔ PBX の SIP・RTP を許可します）。
+- 利用者がそれぞれ別の tailnet を使う場合は、Tailscale のマシンの共有（node sharing）で、このサーバーを利用者の tailnet に、利用者の PBX をこのサーバーの tailnet に共有します。共有されたマシンからは通信を始められないため、PBX からこのサーバーへの着信の INVITE は、このサーバーからの登録・OPTIONS（30秒ごと）で開いた経路を使って届きます。共有の構成では、着信と音声を実機で確かめてから使ってください。
 
 **設定手順**
 
@@ -188,9 +213,9 @@ docker compose exec myvoip myvoip-server enroll-code --extension 201
 4. ログインできる人を決める。`DISCORD_GUILD_ID` を指定するとその Discord サーバーのメンバーだけ、さらに `DISCORD_ROLE_IDS` を指定するとそのロールを持つメンバーだけがログインできる。個別に許可する人は `DISCORD_ALLOWED_USER_IDS`。どれも指定しなければ管理者だけがログインできる。
 5. `docker compose up -d --build --no-deps myvoip` で反映し、`MYVOIP_PUBLIC_URL` をブラウザで開く。
 
-**内線の用意**：先に MikoPBX の画面で利用者用の内線（例 9101〜9110）を作成し、管理画面の「内線を追加・更新する」で番号と SIP パスワードを「割り当て用」として登録します（コマンドなら `extension set --number 9101 --pool`）。中継モードでは、「割り当て用」の内線は利用者に割り当てるまで MikoPBX に登録しません（MikoPBX から見て offline のまま）。すでに使っている内線（例 9002）は、管理画面の「割り当てる」で利用者の管理に移せます。
+**管理コマンドで登録済みの内線（例 9002）を Web に移す**：管理者が自分も Discord でログインして「PBX の設定」を保存し、管理画面で 9002 を自分に割り当てます。割り当てた内線は、利用者の PBX の設定があればそちらへ、なければ既定の PBX（`UPSTREAM_SIP_HOST`）へ登録します。
 
-> **直接モードでの注意**：直接モードでは iPhone に MikoPBX の SIP パスワードを渡すため、iPhone を削除しても、そのパスワードは iPhone に残ります。利用者を入れ替える場合は MikoPBX 側でパスワードを変更し、`extension set` で登録し直してください。複数の利用者で使う場合は中継モードを勧めます（削除のたびに中継用のパスワードを作り直します）。
+> **直接モードでの注意**：直接モード（中継用 Asterisk を使わない構成）では、iPhone が MikoPBX に直接登録するため、利用者ごとの PBX には対応しません。Web 管理画面は中継モードで使ってください。
 
 ## 5. テスト着信
 

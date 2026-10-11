@@ -11,10 +11,10 @@ var (
 	ErrNotFound = errors.New("not found")
 	ErrExpired  = errors.New("expired")
 	ErrUsed     = errors.New("already used")
-	// ErrNoFreeExtension は割り当てられる内線（pool）が残っていない
-	ErrNoFreeExtension = errors.New("no free extension")
 	// ErrLimit は利用者あたりの iPhone の上限に達している
 	ErrLimit = errors.New("limit reached")
+	// ErrDuplicate は同じ利用者が同じ SIP ユーザーの内線をすでに持っている
+	ErrDuplicate = errors.New("duplicate")
 )
 
 // Extension は MikoPBX の既存内線とアプリ用の接続情報（01 §7-1: 内線の正本は MikoPBX）。
@@ -34,8 +34,8 @@ type Extension struct {
 	UpdatedAt          time.Time
 	// OwnerUserID はこの内線を使う利用者（Web 管理画面。空なら未割り当て）
 	OwnerUserID string
-	// Pool は利用者の「iPhoneを追加」で割り当ててよい内線
-	Pool bool
+	// PBXExtension は利用者の PBX での内線番号（表示用。空なら Number）
+	PBXExtension string
 	// Label は利用者が付けた iPhone の名前
 	Label      string
 	AssignedAt *time.Time
@@ -50,6 +50,9 @@ type User struct {
 	Disabled        bool
 	CreatedAt       time.Time
 	LastLoginAt     *time.Time
+	// PBXHost / PBXPort は利用者の PBX の SIP の接続先（中継用 Asterisk から見たアドレス）。空なら未設定
+	PBXHost string
+	PBXPort int
 }
 
 // WebSession は Web 管理画面のログイン状態（Cookie にはトークン、DB にはハッシュ）。
@@ -196,6 +199,7 @@ type Store interface {
 	GetUser(ctx context.Context, id string) (User, error)
 	ListUsers(ctx context.Context) ([]User, error)
 	SetUserDisabled(ctx context.Context, id string, disabled bool) error
+	SetUserPBX(ctx context.Context, id, host string, port int) error
 
 	CreateWebSession(ctx context.Context, s WebSession) error
 	GetWebSession(ctx context.Context, hash string) (WebSession, error)
@@ -203,14 +207,17 @@ type Store interface {
 	DeleteWebSession(ctx context.Context, hash string) error
 	DeleteUserWebSessions(ctx context.Context, userID string) error
 
-	// AssignFreeExtension は pool の空き内線のうち番号の小さいものを利用者に割り当てる。
-	// 利用者の内線が max 以上なら ErrLimit、空きがなければ ErrNoFreeExtension。
-	AssignFreeExtension(ctx context.Context, userID, label string, max int, now time.Time) (Extension, error)
-	// AssignExtension は指定の内線を利用者に割り当てる（管理者の操作）。
+	// CreateOwnedExtension は利用者の内線を登録する。利用者の内線が max 以上なら ErrLimit、
+	// 同じ利用者が同じ SIP ユーザーの内線を持っていれば ErrDuplicate。
+	CreateOwnedExtension(ctx context.Context, e Extension, max int, now time.Time) error
+	// UpdateExtensionSIP は内線の SIP の設定を変える（passwordEnc が nil ならパスワードは変えない）。
+	UpdateExtensionSIP(ctx context.Context, number, pbxExtension, sipUser, authUser string, passwordEnc []byte) error
+	// DeleteExtension は内線と、その端末・登録コード・履歴を消す。
+	DeleteExtension(ctx context.Context, number string) error
+	// AssignExtension は持ち主のいない内線を利用者に割り当てる（管理者の操作）。
 	AssignExtension(ctx context.Context, number, userID, label string, now time.Time) error
 	// ReleaseExtension は内線の割り当てを外し、端末・登録コード・履歴を消す（次の利用者に引き継がない）。
 	ReleaseExtension(ctx context.Context, number string, now time.Time) error
-	SetExtensionPool(ctx context.Context, number string, pool bool) error
 	SetExtensionLabel(ctx context.Context, number, label string) error
 	ListExtensionsByOwner(ctx context.Context, userID string) ([]Extension, error)
 

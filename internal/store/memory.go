@@ -47,9 +47,9 @@ func (m *Memory) UpsertExtension(_ context.Context, e Extension) error {
 			e.MobilePasswordEnc = old.MobilePasswordEnc
 		}
 		// 割り当ては UpsertExtension では変えない（PostgreSQL 実装と同じ）
-		e.OwnerUserID, e.Pool, e.Label, e.AssignedAt = old.OwnerUserID, old.Pool, old.Label, old.AssignedAt
+		e.OwnerUserID, e.PBXExtension, e.Label, e.AssignedAt = old.OwnerUserID, old.PBXExtension, old.Label, old.AssignedAt
 	} else {
-		e.OwnerUserID, e.Label, e.AssignedAt = "", "", nil
+		e.OwnerUserID, e.PBXExtension, e.Label, e.AssignedAt = "", "", "", nil
 	}
 	m.extensions[e.Number] = e
 	return nil
@@ -446,33 +446,88 @@ func (m *Memory) DeleteUserWebSessions(_ context.Context, userID string) error {
 	return nil
 }
 
-func (m *Memory) AssignFreeExtension(_ context.Context, userID, label string, max int, now time.Time) (Extension, error) {
+func (m *Memory) SetUserPBX(_ context.Context, id, host string, port int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.users[userID]; !ok {
-		return Extension{}, ErrNotFound
+	u, ok := m.users[id]
+	if !ok {
+		return ErrNotFound
+	}
+	u.PBXHost, u.PBXPort = host, port
+	m.users[id] = u
+	return nil
+}
+
+func (m *Memory) CreateOwnedExtension(_ context.Context, e Extension, max int, now time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.users[e.OwnerUserID]; !ok {
+		return ErrNotFound
 	}
 	owned := 0
-	var free []Extension
-	for _, e := range m.extensions {
-		if e.OwnerUserID == userID {
-			owned++
+	for _, x := range m.extensions {
+		if x.OwnerUserID != e.OwnerUserID {
+			continue
 		}
-		if e.Pool && e.OwnerUserID == "" {
-			free = append(free, e)
+		if x.SIPUsername == e.SIPUsername {
+			return ErrDuplicate
 		}
+		owned++
 	}
 	if owned >= max {
-		return Extension{}, ErrLimit
+		return ErrLimit
 	}
-	if len(free) == 0 {
-		return Extension{}, ErrNoFreeExtension
+	if _, exists := m.extensions[e.Number]; exists {
+		return ErrDuplicate
 	}
-	sortExtensions(free)
-	e := free[0]
-	e.OwnerUserID, e.Label, e.AssignedAt = userID, label, &now
+	e.AssignedAt, e.UpdatedAt = &now, now
 	m.extensions[e.Number] = e
-	return e, nil
+	return nil
+}
+
+func (m *Memory) UpdateExtensionSIP(_ context.Context, number, pbxExtension, sipUser, authUser string, passwordEnc []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e, ok := m.extensions[number]
+	if !ok {
+		return ErrNotFound
+	}
+	e.PBXExtension, e.SIPUsername, e.SIPAuthUsername, e.Endpoint = pbxExtension, sipUser, authUser, sipUser
+	if passwordEnc != nil {
+		e.SIPPasswordEnc = passwordEnc
+	}
+	m.extensions[number] = e
+	return nil
+}
+
+func (m *Memory) DeleteExtension(_ context.Context, number string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.extensions[number]; !ok {
+		return ErrNotFound
+	}
+	delete(m.extensions, number)
+	for id, d := range m.devices {
+		if d.Extension == number {
+			delete(m.devices, id)
+			for h, t := range m.tokens {
+				if t.DeviceID == id {
+					delete(m.tokens, h)
+				}
+			}
+		}
+	}
+	for h, c := range m.codes {
+		if c.Extension == number {
+			delete(m.codes, h)
+		}
+	}
+	for id, h := range m.history {
+		if h.Extension == number {
+			delete(m.history, id)
+		}
+	}
+	return nil
 }
 
 func (m *Memory) AssignExtension(_ context.Context, number, userID, label string, now time.Time) error {
@@ -514,18 +569,6 @@ func (m *Memory) ReleaseExtension(_ context.Context, number string, now time.Tim
 			delete(m.history, id)
 		}
 	}
-	return nil
-}
-
-func (m *Memory) SetExtensionPool(_ context.Context, number string, pool bool) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	e, ok := m.extensions[number]
-	if !ok {
-		return ErrNotFound
-	}
-	e.Pool = pool
-	m.extensions[number] = e
 	return nil
 }
 

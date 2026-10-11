@@ -107,12 +107,12 @@ func (p *Postgres) UpsertExtension(ctx context.Context, e Extension) error {
 }
 
 const extensionColumns = `number, display_name, sip_username, sip_auth_username, sip_password_enc, endpoint, ring_timeout_seconds, updated_at, mobile_password_enc,
-	COALESCE(owner_user_id, ''), pool, label, assigned_at`
+	COALESCE(owner_user_id, ''), pbx_extension, label, assigned_at`
 
 func scanExtension(row pgx.Row) (Extension, error) {
 	var e Extension
 	err := row.Scan(&e.Number, &e.DisplayName, &e.SIPUsername, &e.SIPAuthUsername, &e.SIPPasswordEnc, &e.Endpoint, &e.RingTimeoutSeconds, &e.UpdatedAt, &e.MobilePasswordEnc,
-		&e.OwnerUserID, &e.Pool, &e.Label, &e.AssignedAt)
+		&e.OwnerUserID, &e.PBXExtension, &e.Label, &e.AssignedAt)
 	return e, notFound(err)
 }
 
@@ -402,11 +402,11 @@ func (p *Postgres) PurgeHistoryBefore(ctx context.Context, before time.Time) (in
 
 // --- Web 管理画面：利用者
 
-const userColumns = `id, discord_id, discord_username, display_name, disabled, created_at, last_login_at`
+const userColumns = `id, discord_id, discord_username, display_name, disabled, created_at, last_login_at, pbx_host, pbx_port`
 
 func scanUser(row pgx.Row) (User, error) {
 	var u User
-	err := row.Scan(&u.ID, &u.DiscordID, &u.DiscordUsername, &u.DisplayName, &u.Disabled, &u.CreatedAt, &u.LastLoginAt)
+	err := row.Scan(&u.ID, &u.DiscordID, &u.DiscordUsername, &u.DisplayName, &u.Disabled, &u.CreatedAt, &u.LastLoginAt, &u.PBXHost, &u.PBXPort)
 	return u, notFound(err)
 }
 
@@ -441,6 +441,17 @@ func (p *Postgres) ListUsers(ctx context.Context) ([]User, error) {
 
 func (p *Postgres) SetUserDisabled(ctx context.Context, id string, disabled bool) error {
 	tag, err := p.pool.Exec(ctx, `UPDATE users SET disabled=$2 WHERE id=$1`, id, disabled)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (p *Postgres) SetUserPBX(ctx context.Context, id, host string, port int) error {
+	tag, err := p.pool.Exec(ctx, `UPDATE users SET pbx_host=$2, pbx_port=$3 WHERE id=$1`, id, host, port)
 	if err != nil {
 		return err
 	}
@@ -487,41 +498,71 @@ func (p *Postgres) DeleteUserWebSessions(ctx context.Context, userID string) err
 
 // --- Web 管理画面：内線の割り当て
 
-func (p *Postgres) AssignFreeExtension(ctx context.Context, userID, label string, max int, now time.Time) (Extension, error) {
+func (p *Postgres) CreateOwnedExtension(ctx context.Context, e Extension, max int, now time.Time) error {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
-		return Extension{}, err
+		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	// 同じ利用者の同時追加で上限を超えないよう、利用者の行を押さえる
 	var id string
-	if err := tx.QueryRow(ctx, `SELECT id FROM users WHERE id=$1 FOR UPDATE`, userID).Scan(&id); err != nil {
-		return Extension{}, notFound(err)
+	if err := tx.QueryRow(ctx, `SELECT id FROM users WHERE id=$1 FOR UPDATE`, e.OwnerUserID).Scan(&id); err != nil {
+		return notFound(err)
 	}
-	var owned int
-	if err := tx.QueryRow(ctx, `SELECT count(*) FROM extensions WHERE owner_user_id=$1`, userID).Scan(&owned); err != nil {
-		return Extension{}, err
+	var owned, same int
+	if err := tx.QueryRow(ctx, `SELECT count(*), count(*) FILTER (WHERE sip_username=$2) FROM extensions WHERE owner_user_id=$1`,
+		e.OwnerUserID, e.SIPUsername).Scan(&owned, &same); err != nil {
+		return err
+	}
+	if same > 0 {
+		return ErrDuplicate
 	}
 	if owned >= max {
-		return Extension{}, ErrLimit
+		return ErrLimit
 	}
-	var number string
-	err = tx.QueryRow(ctx, `
-		SELECT number FROM extensions WHERE pool AND owner_user_id IS NULL
-		ORDER BY length(number), number LIMIT 1 FOR UPDATE SKIP LOCKED`).Scan(&number)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Extension{}, ErrNoFreeExtension
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO extensions(number, display_name, sip_username, sip_auth_username, sip_password_enc, endpoint, ring_timeout_seconds,
+			mobile_password_enc, owner_user_id, pbx_extension, label, assigned_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,now())`,
+		e.Number, e.DisplayName, e.SIPUsername, e.SIPAuthUsername, e.SIPPasswordEnc, e.Endpoint, e.RingTimeoutSeconds,
+		e.MobilePasswordEnc, e.OwnerUserID, e.PBXExtension, e.Label, now); err != nil {
+		return err
 	}
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) UpdateExtensionSIP(ctx context.Context, number, pbxExtension, sipUser, authUser string, passwordEnc []byte) error {
+	tag, err := p.pool.Exec(ctx, `
+		UPDATE extensions SET pbx_extension=$2, sip_username=$3, sip_auth_username=$4, endpoint=$3,
+			sip_password_enc=COALESCE($5, sip_password_enc), updated_at=now()
+		WHERE number=$1`, number, pbxExtension, sipUser, authUser, passwordEnc)
 	if err != nil {
-		return Extension{}, err
+		return err
 	}
-	e, err := scanExtension(tx.QueryRow(ctx, `
-		UPDATE extensions SET owner_user_id=$2, label=$3, assigned_at=$4, updated_at=now() WHERE number=$1
-		RETURNING `+extensionColumns, number, userID, label, now))
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (p *Postgres) DeleteExtension(ctx context.Context, number string) error {
+	tx, err := p.pool.Begin(ctx)
 	if err != nil {
-		return Extension{}, err
+		return err
 	}
-	return e, tx.Commit(ctx)
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if _, err := tx.Exec(ctx, `DELETE FROM history WHERE extension=$1`, number); err != nil {
+		return err
+	}
+	// 端末（とそのトークン）・登録コードは外部キーでまとめて消える
+	tag, err := tx.Exec(ctx, `DELETE FROM extensions WHERE number=$1`, number)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return tx.Commit(ctx)
 }
 
 func (p *Postgres) AssignExtension(ctx context.Context, number, userID, label string, now time.Time) error {
@@ -565,17 +606,6 @@ func (p *Postgres) ReleaseExtension(ctx context.Context, number string, now time
 		return err
 	}
 	return tx.Commit(ctx)
-}
-
-func (p *Postgres) SetExtensionPool(ctx context.Context, number string, pool bool) error {
-	tag, err := p.pool.Exec(ctx, `UPDATE extensions SET pool=$2, updated_at=now() WHERE number=$1`, number, pool)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	return nil
 }
 
 func (p *Postgres) SetExtensionLabel(ctx context.Context, number, label string) error {

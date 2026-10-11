@@ -11,31 +11,56 @@
 </section>
 
 <section class="card">
-  <h2>内線</h2>
-  <p class="muted">「割り当て用」にした内線は、利用者が「iPhone を追加」したときに番号の小さい順に割り当てられます（空き {{.Data.FreeCount}}）。
-  {{if .Data.Relay}}割り当てていない「割り当て用」の内線は MikoPBX に登録しません。{{end}}</p>
+  <h2>利用者</h2>
   <div class="scroll">
   <table class="list">
-    <thead><tr><th>内線</th><th>表示名</th><th>利用者・名前</th><th>端末</th><th>割り当て用</th><th>操作</th></tr></thead>
+    <thead><tr><th>名前</th><th>Discord</th><th>PBX</th><th>iPhone</th><th>最終ログイン</th><th>状態</th></tr></thead>
+    <tbody>
+    {{range .Data.Users}}
+    <tr>
+      <td>{{.User.DisplayName}}{{if .IsAdmin}} <span class="tag">管理者</span>{{end}}</td>
+      <td>{{.User.DiscordUsername}}</td>
+      <td>{{if .User.PBXHost}}{{.User.PBXHost}}:{{.User.PBXPort}}{{else}}<span class="muted">未設定</span>{{end}}</td>
+      <td>{{.Phones}}</td>
+      <td>{{if .User.LastLoginAt}}{{datetime .User.LastLoginAt}}{{end}}</td>
+      <td>
+        <form method="post" action="/admin/users/{{.User.ID}}/disabled" class="inline">
+          <input type="hidden" name="csrf" value="{{$csrf}}">
+          {{if .User.Disabled}}<input type="hidden" name="disabled" value="0"><span class="muted">停止中</span> <button class="small">再開</button>
+          {{else if not .IsAdmin}}<input type="hidden" name="disabled" value="1"><button class="small">ログインを停止</button>{{end}}
+        </form>
+      </td>
+    </tr>
+    {{else}}
+    <tr><td colspan="6" class="muted">まだ誰もログインしていません。</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+  </div>
+  <p class="muted">ログインを停止しても、その利用者の iPhone の着信・発信は止まりません。止めるには、サポートで利用者の画面を開いて iPhone を削除してください。</p>
+</section>
+
+<section class="card">
+  <h2>内線</h2>
+  <p class="muted">利用者が Web で登録した内線と、管理コマンド（extension set）で登録した内線です。管理コマンドで登録した持ち主のいない内線は既定の PBX（UPSTREAM_SIP_HOST）に登録し、利用者に割り当てるとその利用者の PBX に登録します。</p>
+  <div class="scroll">
+  <table class="list">
+    <thead><tr><th>内線</th><th>利用者・名前</th><th>PBX</th><th>端末</th><th>操作</th></tr></thead>
     <tbody>
     {{range .Data.Extensions}}
     <tr>
-      <td>{{.Ext.Number}}{{if and $.Data.Relay .InRelay}} <span class="tag">登録中</span>{{end}}</td>
-      <td>{{.Ext.DisplayName}}</td>
-      <td>{{if .Ext.OwnerUserID}}{{.OwnerName}}・{{.Ext.Label}}{{else}}<span class="muted">未割り当て</span>{{end}}</td>
+      <td>{{.Display}}{{if ne .Display .Ext.Number}} <span class="muted">（{{.Ext.Number}}）</span>{{end}}</td>
+      <td>{{if .Ext.OwnerUserID}}{{.OwnerName}}・{{.Ext.Label}}{{else}}<span class="muted">なし</span>{{end}}</td>
+      <td>{{.PBX}}</td>
       <td>{{if .Enrolled}}登録済み{{else}}<span class="muted">なし</span>{{end}}</td>
       <td>
-        <form method="post" action="/admin/extensions/{{.Ext.Number}}/pool" class="inline">
-          <input type="hidden" name="csrf" value="{{$csrf}}">
-          {{if .Ext.Pool}}<button class="small">割り当て用をやめる</button>{{else}}<input type="hidden" name="pool" value="on"><button class="small">割り当て用にする</button>{{end}}
-        </form>
-      </td>
-      <td>
         {{if .Ext.OwnerUserID}}
-        <form method="post" action="/admin/extensions/{{.Ext.Number}}/release" class="inline" data-confirm="内線 {{.Ext.Number}} の割り当てを解除します。利用者の iPhone は使えなくなり、履歴も消えます。よろしいですか？">
-          <input type="hidden" name="csrf" value="{{$csrf}}">
-          <button class="small danger">割り当てを解除</button>
-        </form>
+          {{if not .Ext.PBXExtension}}
+          <form method="post" action="/admin/extensions/{{.Ext.Number}}/release" class="inline" data-confirm="内線 {{.Display}} の割り当てを解除します。利用者の iPhone は使えなくなり、履歴も消えます。よろしいですか？">
+            <input type="hidden" name="csrf" value="{{$csrf}}">
+            <button class="small danger">割り当てを解除</button>
+          </form>
+          {{end}}
         {{else if $users}}
         <form method="post" action="/admin/extensions/{{.Ext.Number}}/assign" class="inline">
           <input type="hidden" name="csrf" value="{{$csrf}}">
@@ -49,54 +74,10 @@
       </td>
     </tr>
     {{else}}
-    <tr><td colspan="6" class="muted">内線がありません。下のフォームで追加してください。</td></tr>
+    <tr><td colspan="5" class="muted">内線はまだありません。</td></tr>
     {{end}}
     </tbody>
   </table>
   </div>
-
-  <details>
-    <summary>内線を追加・更新する</summary>
-    <p class="muted">先に MikoPBX の画面で内線を作成し、その番号と SIP パスワードを入力します。同じ番号を入力すると上書きします。</p>
-    <form method="post" action="/admin/extensions" class="grid">
-      <input type="hidden" name="csrf" value="{{$csrf}}">
-      <label>内線番号<input name="number" required maxlength="40"></label>
-      <label>表示名<input name="display_name" maxlength="60"></label>
-      <label>SIP ユーザー名（省略時は内線番号）<input name="sip_user" maxlength="40"></label>
-      <label>認証ユーザー名（省略時は SIP ユーザー名）<input name="auth_user" maxlength="40"></label>
-      <label>SIP パスワード<input name="password" type="password" required autocomplete="new-password"></label>
-      <label class="check"><input type="checkbox" name="pool" value="on" checked> 割り当て用にする</label>
-      <button class="primary">保存</button>
-    </form>
-  </details>
-</section>
-
-<section class="card">
-  <h2>利用者</h2>
-  <div class="scroll">
-  <table class="list">
-    <thead><tr><th>名前</th><th>Discord</th><th>iPhone</th><th>最終ログイン</th><th>状態</th></tr></thead>
-    <tbody>
-    {{range .Data.Users}}
-    <tr>
-      <td>{{.User.DisplayName}}{{if .IsAdmin}} <span class="tag">管理者</span>{{end}}</td>
-      <td>{{.User.DiscordUsername}}</td>
-      <td>{{.Phones}}</td>
-      <td>{{if .User.LastLoginAt}}{{datetime .User.LastLoginAt}}{{end}}</td>
-      <td>
-        <form method="post" action="/admin/users/{{.User.ID}}/disabled" class="inline">
-          <input type="hidden" name="csrf" value="{{$csrf}}">
-          {{if .User.Disabled}}<input type="hidden" name="disabled" value="0"><span class="muted">停止中</span> <button class="small">再開</button>
-          {{else if not .IsAdmin}}<input type="hidden" name="disabled" value="1"><button class="small">ログインを停止</button>{{end}}
-        </form>
-      </td>
-    </tr>
-    {{else}}
-    <tr><td colspan="5" class="muted">まだ誰もログインしていません。</td></tr>
-    {{end}}
-    </tbody>
-  </table>
-  </div>
-  <p class="muted">ログインを停止しても、その利用者の iPhone の着信・発信は止まりません。止めるには内線の割り当てを解除してください。</p>
 </section>
 {{end}}

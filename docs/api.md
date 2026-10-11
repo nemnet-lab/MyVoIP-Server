@@ -37,6 +37,7 @@ iPhone アプリ（MyVoIP）と着信制御サービスの間の API。サーバ
 }
 ```
 
+- `extension.number` は表示用の内線番号（利用者の PBX での番号）。中継モードの `sip.username` は中継用 Asterisk での識別子（Web 管理画面で作った内線は `mv` で始まる）で、内線番号と異なることがある。
 - `transport`：`udp` / `tcp` / `tls`。`proxy_host` は省略時 `domain`、`proxy_port` は省略時 udp/tcp なら 5060、tls なら 5061。
 - `srtp`：`optional`（相手が対応すれば SRTP）/ `mandatory`（SRTP 必須）/ `disabled`（暗号化しない）。省略時は `optional`。
 - コード不正・期限切れは 401 `invalid_code`、使用済みは 409 `code_used`（アプリはどちらも「登録コードが無効」と表示）。失敗が IP あたり1分10回を超えると 429。
