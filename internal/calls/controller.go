@@ -87,6 +87,16 @@ type Options struct {
 	ContactWait time.Duration
 	// TestPromptLimit はテスト着信のガイダンスの終了を待つ上限
 	TestPromptLimit time.Duration
+	// DialExtensionNumber は端末レッグの発呼先を内線番号のエンドポイントにする（中継モード）
+	DialExtensionNumber bool
+}
+
+// dialEndpoint は端末レッグを発呼する PJSIP エンドポイント名。
+func (c *Controller) dialEndpoint(ext store.Extension) string {
+	if c.opts.DialExtensionNumber || ext.Endpoint == "" {
+		return ext.Number
+	}
+	return ext.Endpoint
 }
 
 type Controller struct {
@@ -314,7 +324,7 @@ func (c *Controller) onIncoming(ch ari.Channel, extension string) {
 		return
 	}
 	call.State = StatePushing
-	a := &active{call: call, device: device, endpoint: ext.Endpoint}
+	a := &active{call: call, device: device, endpoint: c.dialEndpoint(ext)}
 	c.calls[call.ID] = a
 	c.byChannel[ch.ID] = call.ID
 	_ = c.store.SaveCall(ctx, call)
@@ -803,7 +813,7 @@ func (c *Controller) StartTestCall(ctx context.Context, device store.Device) (st
 		c.mu.Unlock()
 		return "", ErrBusy
 	}
-	a := &active{call: call, device: device, endpoint: ext.Endpoint}
+	a := &active{call: call, device: device, endpoint: c.dialEndpoint(ext)}
 	c.calls[call.ID] = a
 	_ = c.store.SaveCall(ctx, call)
 	a.timer = time.AfterFunc(time.Until(call.ExpiresAt), func() { c.onTimeout(call.ID) })

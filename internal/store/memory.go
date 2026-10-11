@@ -34,7 +34,22 @@ func (m *Memory) UpsertExtension(_ context.Context, e Extension) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	e.UpdatedAt = time.Now()
+	if old, ok := m.extensions[e.Number]; ok && e.MobilePasswordEnc == nil {
+		e.MobilePasswordEnc = old.MobilePasswordEnc
+	}
 	m.extensions[e.Number] = e
+	return nil
+}
+
+func (m *Memory) SetMobilePassword(_ context.Context, number string, enc []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e, ok := m.extensions[number]
+	if !ok {
+		return ErrNotFound
+	}
+	e.MobilePasswordEnc = enc
+	m.extensions[number] = e
 	return nil
 }
 

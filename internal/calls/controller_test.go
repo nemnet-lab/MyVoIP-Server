@@ -334,7 +334,7 @@ func TestCurrentContact(t *testing.T) {
 
 func TestRemovedContactIsForgotten(t *testing.T) {
 	f := newFixture(t, 30*time.Second)
-	uri := "sip:201@100.100.56.35:50000;myvoip-reg=r9"
+	uri := "sip:201@100.64.0.30:50000;myvoip-reg=r9"
 	ev := func(status string) ari.Event {
 		return ari.Event{Type: "ContactStatusChange", Endpoint: &ari.EndpointInfo{Resource: "201"},
 			ContactInfo: &ari.ContactInfo{URI: uri, ContactStatus: status, AOR: "201"}}
@@ -408,7 +408,7 @@ func TestTestCallRecordingFailureEndsGracefully(t *testing.T) {
 	id, _ := f.ctrl.StartTestCall(context.Background(), f.device)
 	<-f.push.sent
 	f.ctrl.HandleEvent(ari.Event{Type: "ContactStatusChange", Endpoint: &ari.EndpointInfo{Resource: "201"},
-		ContactInfo: &ari.ContactInfo{URI: "sip:201@100.100.56.35:1;myvoip-reg=x1", ContactStatus: "Reachable"}})
+		ContactInfo: &ari.ContactInfo{URI: "sip:201@100.64.0.30:1;myvoip-reg=x1", ContactStatus: "Reachable"}})
 	_, _ = f.ctrl.Ready(context.Background(), "d-1", id, "x1")
 	devCh := "myvoip-dev-" + id
 	waitFor(t, func() bool { return f.ari.has("dial " + devCh) })
@@ -433,7 +433,7 @@ func TestTestCallProceedsWhenPromptNeverFinishes(t *testing.T) {
 	id, _ := f.ctrl.StartTestCall(context.Background(), f.device)
 	<-f.push.sent
 	f.ctrl.HandleEvent(ari.Event{Type: "ContactStatusChange", Endpoint: &ari.EndpointInfo{Resource: "201"},
-		ContactInfo: &ari.ContactInfo{URI: "sip:201@100.100.56.35:1;myvoip-reg=p1", ContactStatus: "Reachable"}})
+		ContactInfo: &ari.ContactInfo{URI: "sip:201@100.64.0.30:1;myvoip-reg=p1", ContactStatus: "Reachable"}})
 	_, _ = f.ctrl.Ready(context.Background(), "d-1", id, "p1")
 	devCh := "myvoip-dev-" + id
 	waitFor(t, func() bool { return f.ari.has("dial " + devCh) })
@@ -459,7 +459,7 @@ func TestTestCallRecordingFailedEventEndsGracefully(t *testing.T) {
 	id, _ := f.ctrl.StartTestCall(context.Background(), f.device)
 	<-f.push.sent
 	f.ctrl.HandleEvent(ari.Event{Type: "ContactStatusChange", Endpoint: &ari.EndpointInfo{Resource: "201"},
-		ContactInfo: &ari.ContactInfo{URI: "sip:201@100.100.56.35:1;myvoip-reg=q1", ContactStatus: "Reachable"}})
+		ContactInfo: &ari.ContactInfo{URI: "sip:201@100.64.0.30:1;myvoip-reg=q1", ContactStatus: "Reachable"}})
 	_, _ = f.ctrl.Ready(context.Background(), "d-1", id, "q1")
 	devCh := "myvoip-dev-" + id
 	waitFor(t, func() bool { return f.ari.has("dial " + devCh) })
@@ -545,11 +545,11 @@ func TestTestCallPlaysRecordsAndEnds(t *testing.T) {
 	// テスト着信には発信側チャネルがないので、ContactStatusChange で知った登録先を使う
 	f.ctrl.HandleEvent(ari.Event{Type: "ContactStatusChange",
 		Endpoint:    &ari.EndpointInfo{Technology: "PJSIP", Resource: "201", State: "online"},
-		ContactInfo: &ari.ContactInfo{URI: "sip:201@100.100.56.35:54482;myvoip-reg=t1", ContactStatus: "Reachable", AOR: "201"}})
+		ContactInfo: &ari.ContactInfo{URI: "sip:201@100.64.0.30:54482;myvoip-reg=t1", ContactStatus: "Reachable", AOR: "201"}})
 	_, _ = f.ctrl.Ready(context.Background(), "d-1", id, "t1")
 	devCh := "myvoip-dev-" + id
 	waitFor(t, func() bool { return f.ari.has("dial " + devCh + " caller=") })
-	if !f.ari.has("create PJSIP/201/sip:201@100.100.56.35:54482;myvoip-reg=t1 device," + id) {
+	if !f.ari.has("create PJSIP/201/sip:201@100.64.0.30:54482;myvoip-reg=t1 device," + id) {
 		t.Fatalf("test call must target the contact from the event, ops=%v", f.ari.ops)
 	}
 	f.ctrl.HandleEvent(ari.Event{Type: "ChannelStateChange", Channel: &ari.Channel{ID: devCh, State: "Up"}})

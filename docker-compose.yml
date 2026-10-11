@@ -31,17 +31,43 @@ services:
     environment:
       DATABASE_URL: postgres://myvoip:${DB_PASSWORD}@db:5432/myvoip?sslmode=disable
       APNS_KEY_FILE: /run/secrets/apns.p8
+      RELAY_CONFIG_DIR: /srv/asterisk-myvoip
       TZ: Asia/Tokyo
     volumes:
       - ./secrets:/run/secrets:ro
+      - relay_config:/srv/asterisk-myvoip
     depends_on:
       db:
         condition: service_healthy
+      asterisk:
+        condition: service_started
+        required: false
     healthcheck:
       test: ["CMD", "/usr/local/bin/myvoip-server", "healthcheck"]
       interval: 10s
       timeout: 5s
       retries: 3
+
+  # 中継用 Asterisk（COMPOSE_PROFILES に relay を含めたときだけ起動）
+  # MikoPBX に内線として常時登録し、iPhone の登録先になる。SIP・RTP のため host ネットワークで動かす。
+  # ARI は Compose のネットワークのゲートウェイだけで待ち受け、myvoip コンテナ以外からは届かない。
+  asterisk:
+    profiles: ["relay"]
+    build: ./asterisk
+    image: myvoip-asterisk:latest
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      ARI_USER: ${ARI_USER:-myvoip}
+      ARI_PASSWORD: ${ARI_PASSWORD:?ARI_PASSWORD を .env に設定してください}
+      ARI_BIND_ADDRESS: ${MYVOIP_DOCKER_GATEWAY:-10.211.0.1}
+      RELAY_SIP_PORT: ${RELAY_SIP_PORT:-5060}
+      RELAY_RTP_START: ${RELAY_RTP_START:-10000}
+      RELAY_RTP_END: ${RELAY_RTP_END:-10999}
+      TZ: Asia/Tokyo
+    volumes:
+      - relay_config:/etc/asterisk/myvoip
+      - relay_spool:/var/spool/asterisk
 
   # リバースプロキシは .env の COMPOSE_PROFILES=caddy または nginx で選ぶ
   caddy:
@@ -71,6 +97,16 @@ services:
     depends_on:
       - myvoip
 
+networks:
+  default:
+    ipam:
+      config:
+        # 中継用 Asterisk の ARI はこのネットワークのゲートウェイで待ち受ける（LAN と重ならない範囲にする）
+        - subnet: ${MYVOIP_DOCKER_SUBNET:-10.211.0.0/24}
+          gateway: ${MYVOIP_DOCKER_GATEWAY:-10.211.0.1}
+
 volumes:
   db:
   caddy_data:
+  relay_config:
+  relay_spool:

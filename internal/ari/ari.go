@@ -248,9 +248,39 @@ func (c *Client) DeleteStoredRecording(ctx context.Context, name string) error {
 	return err
 }
 
+// ReloadModule は Asterisk のモジュールを再読み込みする（設定の反映）。
+func (c *Client) ReloadModule(ctx context.Context, name string) error {
+	return c.do(ctx, http.MethodPut, "/asterisk/modules/"+url.PathEscape(name), nil, nil)
+}
+
 // Ping は接続確認（/asterisk/info）。
 func (c *Client) Ping(ctx context.Context) error {
 	return c.do(ctx, http.MethodGet, "/asterisk/info", nil, nil)
+}
+
+func (c *Client) subscribeUntilDone(ctx context.Context, source string) {
+	delay := 2 * time.Second
+	for {
+		subCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err := c.Subscribe(subCtx, source)
+		cancel()
+		if err == nil {
+			c.log.Info("ARI subscribed", "source", source)
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		c.log.Warn("ARI subscription failed; retrying", "source", source, "error", err, "retry_in", delay.String())
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		if delay < 30*time.Second {
+			delay *= 2
+		}
+	}
 }
 
 // Run は ARI の WebSocket に接続し、切断されたら待って再接続する。ctx が終わるまで戻らない。
@@ -300,15 +330,12 @@ func (c *Client) listen(ctx context.Context, handle func(Event)) error {
 	conn.SetReadLimit(1 << 20)
 	c.log.Info("ARI events connected", "app", c.app)
 
-	// アプリは WebSocket の接続で作られるため、購読は接続のたびにやり直す
+	// アプリは WebSocket の接続で作られるため、購読は接続のたびにやり直す。
+	// 対象（例 PJSIP のエンドポイント）がまだ1つもないと拒否されるので、成功するまで再試行する
+	connCtx, cancelConn := context.WithCancel(ctx)
+	defer cancelConn()
 	for _, source := range c.subscriptions {
-		subCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		if err := c.Subscribe(subCtx, source); err != nil {
-			c.log.Warn("ARI subscription failed", "source", source, "error", err)
-		} else {
-			c.log.Info("ARI subscribed", "source", source)
-		}
-		cancel()
+		go c.subscribeUntilDone(connCtx, source)
 	}
 
 	for {

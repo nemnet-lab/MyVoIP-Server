@@ -30,7 +30,8 @@ jobs:
       - name: Validate compose file
         run: |
           cp .env.example .env
+          sed -i 's/^ARI_PASSWORD=.*/ARI_PASSWORD=ci/' .env
           docker compose config --quiet
-          COMPOSE_PROFILES=nginx docker compose config --quiet
-      - name: Build image
-        run: docker compose build myvoip
+          COMPOSE_PROFILES=nginx,relay docker compose config --quiet
+      - name: Build images
+        run: COMPOSE_PROFILES=caddy,relay docker compose build myvoip asterisk

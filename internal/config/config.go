@@ -44,6 +44,16 @@ type Config struct {
 	HistoryRetention  time.Duration
 
 	TestCallSound string
+
+	// 中継モード：VoIP Push サーバー内の Asterisk が MikoPBX に内線として登録し、iPhone はその Asterisk に登録する
+	RelayEnabled bool
+	// RelayConfigDir は中継用 Asterisk の設定（pjsip_myvoip.conf）を書き出すディレクトリ
+	RelayConfigDir string
+	// UpstreamSIPHost / Port は MikoPBX の SIP の接続先（中継用 Asterisk から見たアドレス）
+	UpstreamSIPHost string
+	UpstreamSIPPort int
+	// APNSEndpoint は APNs の送信先の上書き（試験用。通常は空）
+	APNSEndpoint string
 	// AllowedClients は API に接続できるクライアントのアドレス帯（MYVOIP_ALLOWED_CLIENT_CIDRS）
 	AllowedClients []netip.Prefix
 }
@@ -94,6 +104,12 @@ func Load(requireRuntime bool) (Config, error) {
 		HistoryRetention:  180 * 24 * time.Hour,
 
 		TestCallSound: env("TEST_CALL_SOUND", "sound:vm-intro"),
+
+		RelayEnabled:    strings.EqualFold(env("RELAY_ENABLED", "false"), "true"),
+		RelayConfigDir:  env("RELAY_CONFIG_DIR", "/srv/asterisk-myvoip"),
+		UpstreamSIPHost: env("UPSTREAM_SIP_HOST", ""),
+		UpstreamSIPPort: envInt("UPSTREAM_SIP_PORT", 5060),
+		APNSEndpoint:    strings.TrimRight(env("APNS_ENDPOINT", ""), "/"),
 	}
 
 	var errs []string
@@ -134,6 +150,12 @@ func Load(requireRuntime bool) (Config, error) {
 	case "optional", "mandatory", "disabled":
 	default:
 		errs = append(errs, "SIP_SRTP must be optional, mandatory or disabled")
+	}
+	if c.RelayEnabled {
+		need("UPSTREAM_SIP_HOST", c.UpstreamSIPHost)
+		if c.SIPTransport != "udp" {
+			errs = append(errs, "relay mode supports SIP_TRANSPORT=udp only")
+		}
 	}
 	if requireRuntime {
 		need("ARI_URL", c.ARIURL)

@@ -31,6 +31,8 @@ type Config struct {
 	AccessTokenTTL  time.Duration
 	RefreshTokenTTL time.Duration
 	RingTimeout     time.Duration
+	// Relay は中継モード（iPhone は中継用 Asterisk に、サーバーが発行したパスワードで登録する）
+	Relay bool
 	// AllowedClients は API に接続できるクライアントのアドレス帯。空なら制限しない
 	//（例: Tailnet だけに絞るなら 100.64.0.0/10）。ループバックは常に許可する
 	AllowedClients []netip.Prefix
@@ -246,7 +248,17 @@ func (s *Server) enroll(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "server_error")
 		return
 	}
-	password, err := s.box.Open(ext.SIPPasswordEnc)
+	// 中継モードでは iPhone に MikoPBX のパスワードを渡さず、中継用 Asterisk 用のパスワードを渡す
+	sipUser, authUser, passwordEnc := ext.SIPUsername, ext.SIPAuthUsername, ext.SIPPasswordEnc
+	if s.cfg.Relay {
+		sipUser, authUser, passwordEnc = ext.Number, ext.Number, ext.MobilePasswordEnc
+	}
+	if len(passwordEnc) == 0 {
+		s.log.Error("enroll: extension has no SIP password for the device", "extension", ext.Number)
+		writeError(w, http.StatusInternalServerError, "server_error")
+		return
+	}
+	password, err := s.box.Open(passwordEnc)
 	if err != nil {
 		s.log.Error("enroll: decrypt sip password", "error", err)
 		writeError(w, http.StatusInternalServerError, "server_error")
@@ -289,8 +301,8 @@ func (s *Server) enroll(w http.ResponseWriter, r *http.Request) {
 		"domain":        s.cfg.SIPDomain,
 		"transport":     transport,
 		"srtp":          srtp,
-		"username":      ext.SIPUsername,
-		"auth_username": ext.SIPAuthUsername,
+		"username":      sipUser,
+		"auth_username": authUser,
 		"password":      password,
 	}
 	if s.cfg.SIPProxyHost != "" && s.cfg.SIPProxyHost != s.cfg.SIPDomain {

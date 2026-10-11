@@ -8,6 +8,7 @@
 //	myvoip-server revoke-device --device ID   端末の資格情報・Push 紐付けを失効する
 //	myvoip-server check-ari                   ARI への接続と内線の Contact を確認する
 //	myvoip-server gen-secret                  MYVOIP_SECRET_KEY 用の鍵を作る
+//	myvoip-server relay sync                  中継用 Asterisk の設定を書き出して再読み込みさせる（中継モード）
 package main
 
 import (
@@ -31,6 +32,7 @@ import (
 	"github.com/nemnet-lab/MyVoIP-Server/internal/calls"
 	"github.com/nemnet-lab/MyVoIP-Server/internal/config"
 	"github.com/nemnet-lab/MyVoIP-Server/internal/qr"
+	"github.com/nemnet-lab/MyVoIP-Server/internal/relay"
 	"github.com/nemnet-lab/MyVoIP-Server/internal/secret"
 	"github.com/nemnet-lab/MyVoIP-Server/internal/store"
 )
@@ -59,6 +61,8 @@ func main() {
 		err = healthcheck()
 	case "gen-secret":
 		fmt.Println(secret.NewKey())
+	case "relay":
+		err = relayCmd(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -79,7 +83,8 @@ func usage() {
   myvoip-server devices
   myvoip-server revoke-device --device d-xxxx
   myvoip-server check-ari [--extension 201]
-  myvoip-server gen-secret`)
+  myvoip-server gen-secret
+  myvoip-server relay sync`)
 }
 
 func openStore(ctx context.Context, cfg config.Config) (*store.Postgres, error) {
@@ -115,11 +120,17 @@ func serve(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	pusher := apns.New(key, cfg.APNSKeyID, cfg.APNSTeamID, cfg.APNSBundleID)
+	pusher := apns.New(key, cfg.APNSKeyID, cfg.APNSTeamID, cfg.APNSBundleID).WithEndpoint(cfg.APNSEndpoint)
 	ariClient := ari.New(cfg.ARIURL, cfg.ARIUser, cfg.ARIPassword, cfg.ARIApp, log)
 	// PJSIP の登録先の変化（ContactStatusChange）を受け取り、端末への発呼先の特定に使う
 	ariClient.SubscribeOnConnect("endpoint:PJSIP")
-	controller := calls.New(db, ariClient, pusher, log, calls.Options{RingTimeout: cfg.RingTimeout, TestSound: cfg.TestCallSound})
+	controller := calls.New(db, ariClient, pusher, log, calls.Options{
+		RingTimeout: cfg.RingTimeout, TestSound: cfg.TestCallSound, DialExtensionNumber: cfg.RelayEnabled,
+	})
+	if cfg.RelayEnabled {
+		// 中継用 Asterisk の設定を DB から書き出す。Asterisk の起動待ちのため、反映できるまで再試行する
+		go syncRelayUntilDone(ctx, db, box, cfg, ariClient, log)
+	}
 
 	// 再起動前の呼を整理してから待ち受ける。ARI に届かなくても DB 上は終了させる（R-05）
 	controller.Reconcile(ctx)
@@ -144,6 +155,7 @@ func serve(log *slog.Logger) error {
 		RefreshTokenTTL: cfg.RefreshTokenTTL,
 		RingTimeout:     cfg.RingTimeout,
 		AllowedClients:  cfg.AllowedClients,
+		Relay:           cfg.RelayEnabled,
 	}, log)
 	httpServer := &http.Server{
 		Addr:              cfg.Listen,
@@ -162,6 +174,76 @@ func serve(log *slog.Logger) error {
 	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
+	return nil
+}
+
+func relayOptions(cfg config.Config) relay.Options {
+	return relay.Options{
+		UpstreamHost:   cfg.UpstreamSIPHost,
+		UpstreamPort:   cfg.UpstreamSIPPort,
+		AllowedClients: cfg.AllowedClients,
+		SRTP:           cfg.SIPSRTP,
+	}
+}
+
+func syncRelayUntilDone(ctx context.Context, db store.Store, box *secret.Box, cfg config.Config, reloader relay.Reloader, log *slog.Logger) {
+	delay := 2 * time.Second
+	for ctx.Err() == nil {
+		syncCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		err := relay.Sync(syncCtx, db, box, relayOptions(cfg), cfg.RelayConfigDir, reloader)
+		cancel()
+		if err == nil {
+			log.Info("relay configuration applied", "upstream", fmt.Sprintf("%s:%d", cfg.UpstreamSIPHost, cfg.UpstreamSIPPort))
+			// エンドポイントができたので、登録先のイベントの購読をすぐ試す（失敗しても接続側で再試行する）
+			if client, ok := reloader.(*ari.Client); ok {
+				subCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				if err := client.Subscribe(subCtx, "endpoint:PJSIP"); err == nil {
+					log.Info("ARI subscribed", "source", "endpoint:PJSIP")
+				}
+				cancel()
+			}
+			return
+		}
+		log.Warn("relay configuration not applied yet; retrying", "error", err, "retry_in", delay.String())
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		if delay < 30*time.Second {
+			delay *= 2
+		}
+	}
+}
+
+// relayCmd は中継用 Asterisk の設定を書き出して反映する。
+func relayCmd(args []string) error {
+	if len(args) == 0 || args[0] != "sync" {
+		return errors.New("relay sync")
+	}
+	ctx, cfg, db, err := adminContext()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	return relaySync(ctx, cfg, db)
+}
+
+func relaySync(ctx context.Context, cfg config.Config, db store.Store) error {
+	if !cfg.RelayEnabled {
+		return errors.New("RELAY_ENABLED=true ではありません")
+	}
+	box, err := secret.NewBox(cfg.SecretKey)
+	if err != nil {
+		return err
+	}
+	client := ari.New(cfg.ARIURL, cfg.ARIUser, cfg.ARIPassword, cfg.ARIApp, slog.Default())
+	syncCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if err := relay.Sync(syncCtx, db, box, relayOptions(cfg), cfg.RelayConfigDir, client); err != nil {
+		return err
+	}
+	fmt.Printf("中継用 Asterisk の設定を反映しました（MikoPBX %s:%d へ登録）。\n", cfg.UpstreamSIPHost, cfg.UpstreamSIPPort)
 	return nil
 }
 
@@ -294,6 +376,12 @@ func extensionCmd(args []string) error {
 		return err
 	}
 	fmt.Printf("内線 %s を登録しました（SIP ユーザー %s、エンドポイント PJSIP/%s）。\n", *number, *sipUser, *endpoint)
+	if cfg.RelayEnabled {
+		// 中継用 Asterisk が MikoPBX にこの内線として登録するよう、設定を反映する
+		if err := relaySync(ctx, cfg, db); err != nil {
+			fmt.Fprintf(os.Stderr, "警告: 中継用 Asterisk への反映に失敗しました（あとで relay sync を実行してください）: %v\n", err)
+		}
+	}
 	return nil
 }
 

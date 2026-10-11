@@ -10,19 +10,32 @@ iPhone アプリ本体は別リポジトリ（非公開）です。
 
 ## 概要
 
-iPhone アプリ（MyVoIP）が休止中でも着信できるように、MikoPBX の着信を受けて VoIP Push を送り、起きた iPhone へつなぐサービスです。MikoPBX とは別の Linux 環境で、Docker Compose で動かします。
+iPhone アプリ（MyVoIP）が休止中でも着信できるように、着信を受けて VoIP Push を送り、起きた iPhone へつなぐサービスです。MikoPBX とは別の Linux 環境で、Docker Compose で動かします。
 
-**外部に直接公開せず、LAN または VPN 内だけで使う構成**を前提にしており、HTTP や SIP の UDP/TCP（暗号化なし）も選べます。
+**外部に直接公開せず、LAN または VPN（Tailscale など）内だけで使う構成**を前提にしており、HTTP や SIP の UDP（暗号化なし）も選べます。
+
+### 2つの構成
+
+| | 中継モード（推奨） | 直接モード |
+|---|---|---|
+| MikoPBX から見た内線 | **このサーバーが内線として常時登録**（常に online） | iPhone が直接登録（休止中は offline） |
+| MikoPBX の変更 | **なし**（既存の内線と SIP パスワードを使うだけ） | ARI の有効化と、内線への着信を Stasis に渡す設定が必要 |
+| iPhone の登録先 | このサーバー内の中継用 Asterisk（パスワードはサーバーが発行） | MikoPBX |
+| iPhone からの発信 | 中継用 Asterisk が、その内線からの発信として MikoPBX へ送る | MikoPBX へ直接 |
 
 ```
-iPhone（LAN / VPN）──HTTP(S)──▶ Caddy または Nginx ─▶ myvoip（Go）─▶ PostgreSQL
-   │                                                    │
-   │                                                    ├─ARI（LAN 内）──▶ MikoPBX
-   │                                                    └─HTTPS（外向き）─▶ Apple APNs
-   └──SIP（UDP/TCP/TLS）・RTP/SRTP─────────────────────────────────────▶ MikoPBX
+中継モード
+                    ┌──────────── このサーバー ────────────┐
+iPhone ──SIP/RTP──▶ │ 中継用 Asterisk ──内線として登録──▶ │ ──SIP/RTP──▶ MikoPBX
+   │                │   │ ARI                              │
+   └──HTTP(S)─────▶ │ Caddy/Nginx ─▶ myvoip（Go）─▶ PostgreSQL │ ──HTTPS──▶ Apple APNs
+                    └──────────────────────────────────────┘
 ```
 
-> **外出先での着信について**：VoIP Push は Apple 経由で外出先の iPhone にも届きます。しかし、起こされた iPhone がこのサーバーと MikoPBX に届かないと通話がつながりません。携帯回線で着信を受けるには、iPhone で VPN を常時接続（またはオンデマンド接続）にしておく必要があります。
+- 着信：MikoPBX が内線（例 9002）を呼ぶ → 中継用 Asterisk が受けて呼制御（Stasis）に渡す → VoIP Push で iPhone を起こす → iPhone が中継用 Asterisk に登録して ready を送る → その登録先を呼んで発信側とブリッジする。
+- 発信：iPhone → 中継用 Asterisk → MikoPBX（From・認証ともにその内線）。
+
+> **外出先での着信について**：VoIP Push は Apple 経由で外出先の iPhone にも届きます。しかし、起こされた iPhone がこのサーバーに届かないと通話がつながりません。携帯回線で着信を受けるには、iPhone で VPN を常時接続（またはオンデマンド接続）にしておく必要があります。
 
 ## 1. 前提
 
@@ -36,13 +49,20 @@ iPhone（LAN / VPN）──HTTP(S)──▶ Caddy または Nginx ─▶ myvoip�
 
 ## 2. MikoPBX の設定
 
-画面名は MikoPBX の版によって異なることがあります。
+### 中継モード
 
-1. **iPhone 用の内線**を作る（例 `201`）。SIP パスワードを控えておく（後でサーバーに登録する）。
-2. **SIP のトランスポート**：既定は UDP 5060（暗号化なし）。TCP・TLS も選べる。TLS を使う場合は、`SIP_DOMAIN` のホスト名と一致する、iPhone が信頼できる証明書が必要（自己署名は接続できない）。
-3. **音声の暗号化（SRTP）**：必須ではない。既定の `SIP_SRTP=optional` では、MikoPBX が SRTP に対応していれば暗号化し、対応していなければ暗号化なしで通話する。
-4. **ARI ユーザー**を作る（例：ユーザー名 `myvoip`、アプリケーション `myvoip`）。
-5. **着信ルート**（ほかの内線・外線からの着信を、このサービスに渡す設定）は、テスト着信には不要です。[6. 着信ルート](#6-着信ルートmikopbx)を参照。
+MikoPBX の設定変更は不要です。
+
+1. iPhone 用の内線（例 `9002`）を用意し、SIP パスワードを控えておく（後でこのサーバーに登録する）。
+2. このサーバーから MikoPBX の SIP（例 UDP 5060）と RTP の範囲に届き、MikoPBX からこのサーバーの SIP（UDP 5060）と RTP（10000〜10999）に届くこと。
+3. その内線の SIP の登録数（max_contacts）が1以上あること。iPhone を以前 MikoPBX に直接登録していた場合は、古い登録が残っていないこと。
+
+### 直接モード
+
+1. iPhone 用の内線を作り、SIP パスワードを控えておく。
+2. SIP のトランスポート（UDP 5060 など）と、必要なら SRTP を設定する。
+3. ARI を有効にし、ARI ユーザー（例 `myvoip`）を作る（[MikoPBX 2024.1 での ARI の有効化](#mikopbx-20241-での-ari-の有効化)）。
+4. 内線への着信を `Stasis(myvoip,<内線>)` に渡す（[6. 着信ルート](#6-着信ルートmikopbx)。テスト着信だけなら不要）。
 
 ## 3. サーバーの起動
 
@@ -58,6 +78,26 @@ chmod 644 secrets/apns.p8   # コンテナ内の非 root ユーザーが読め�
 docker compose up -d --build
 docker compose logs -f myvoip   # "ARI events connected" が出れば MikoPBX とつながっている
 ```
+
+### 中継モードの設定
+
+`.env` で次のように設定します（[.env.example](.env.example) に既定値があります）。
+
+| 変数 | 例 | 内容 |
+|---|---|---|
+| `COMPOSE_PROFILES` | `caddy,relay` | `relay` を加えると中継用 Asterisk が起動する |
+| `RELAY_ENABLED` | `true` | 中継モードにする |
+| `UPSTREAM_SIP_HOST` / `UPSTREAM_SIP_PORT` | `100.64.0.10` / `5060` | MikoPBX の SIP の接続先（このサーバーから見たアドレス） |
+| `SIP_DOMAIN` | `100.64.0.20` | **このサーバー**のアドレス（iPhone から届くもの）。iPhone はここに登録する |
+| `ARI_URL` | `http://10.211.0.1:8088/ari` | 中継用 Asterisk の ARI（`MYVOIP_DOCKER_GATEWAY` のアドレス） |
+| `ARI_USER` / `ARI_PASSWORD` | `myvoip` / 任意の長い文字列 | 中継用 Asterisk の ARI ユーザー（MikoPBX の ARI とは無関係） |
+| `MYVOIP_DOCKER_SUBNET` / `MYVOIP_DOCKER_GATEWAY` | `10.211.0.0/24` / `10.211.0.1` | Compose のネットワーク。ARI はこのゲートウェイだけで待ち受ける。LAN と重ならない範囲にする |
+| `RELAY_SIP_PORT`、`RELAY_RTP_START`〜`RELAY_RTP_END` | `5060`、`10000`〜`10999` | 中継用 Asterisk の SIP と RTP（host ネットワークで待ち受ける） |
+
+- 中継用 Asterisk は host ネットワークで動き、ホストの UDP 5060 と RTP の範囲を使います。ほかのプロセスが使っていないことを確認してください。
+- `MYVOIP_ALLOWED_CLIENT_CIDRS` を設定すると、API に加えて、iPhone 用の SIP の受け口にも同じ制限がかかります。
+- 内線を登録（`extension set`）すると、中継用 Asterisk の設定が書き出され、すぐに MikoPBX への登録が始まります。手動で反映し直すときは `docker compose exec myvoip myvoip-server relay sync`。
+- 中継モードでは iPhone に MikoPBX のパスワードを渡しません。サーバーが iPhone 用のパスワードを別に発行します。
 
 ### リバースプロキシと HTTPS の選択
 
@@ -205,6 +245,8 @@ docker compose build myvoip         # イメージのビルド
 | 場所 | 内容 |
 |---|---|
 | `cmd/myvoip-server` | サーバー本体と管理コマンド |
+| `asterisk/` | 中継用 Asterisk のイメージと設定のひな形 |
+| `internal/relay` | 中継用 Asterisk の内線ごとの設定の生成 |
 | `internal/calls` | 呼制御（着信の保持・Push・ready の照合・端末への発呼・ブリッジ・終了処理） |
 | `internal/api` | アプリ向け HTTP API と呼状態の WebSocket |
 | `internal/ari` | ARI クライアント |
@@ -225,7 +267,9 @@ docker compose build myvoip         # イメージのビルド
 | `SIP_SRTP=mandatory` で通話できない | MikoPBX 側で SRTP が有効か。不要なら `optional` にする |
 | アプリで登録時に通信できない | iPhone から `MYVOIP_PUBLIC_URL` に届くか（LAN・VPN の接続）。初回は iPhone の「ローカルネットワーク」許可を求められるので許可する |
 | API が 403 `client_not_allowed` | `MYVOIP_ALLOWED_CLIENT_CIDRS` の範囲外から接続している（ログの `client` を確認）。Tailnet 経由で接続しているか |
-| ARI に接続できない（404） | MikoPBX 2024.1 は `ARI_URL` に接頭辞 `/asterisk` が必要 |
+| ARI に接続できない（404） | 直接モードの MikoPBX 2024.1 は `ARI_URL` に接頭辞 `/asterisk` が必要 |
+| 中継モードで MikoPBX に登録できない | `docker compose exec asterisk asterisk -rx "pjsip show registrations"`。`UPSTREAM_SIP_HOST`・内線の SIP パスワード・MikoPBX への到達性 |
+| 中継モードで ARI に接続できない | `ARI_URL` が `MYVOIP_DOCKER_GATEWAY` のアドレスか。Compose のネットワークを変えたら `docker compose down` してから `up` する |
 | アプリで「登録コードが無効」 | 10分の期限切れ・使用済み。コードを再発行する |
 
 ## ライセンス

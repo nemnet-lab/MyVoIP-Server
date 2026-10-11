@@ -106,12 +106,23 @@ func (p *Postgres) UpsertExtension(ctx context.Context, e Extension) error {
 	return err
 }
 
-const extensionColumns = `number, display_name, sip_username, sip_auth_username, sip_password_enc, endpoint, ring_timeout_seconds, updated_at`
+const extensionColumns = `number, display_name, sip_username, sip_auth_username, sip_password_enc, endpoint, ring_timeout_seconds, updated_at, mobile_password_enc`
 
 func scanExtension(row pgx.Row) (Extension, error) {
 	var e Extension
-	err := row.Scan(&e.Number, &e.DisplayName, &e.SIPUsername, &e.SIPAuthUsername, &e.SIPPasswordEnc, &e.Endpoint, &e.RingTimeoutSeconds, &e.UpdatedAt)
+	err := row.Scan(&e.Number, &e.DisplayName, &e.SIPUsername, &e.SIPAuthUsername, &e.SIPPasswordEnc, &e.Endpoint, &e.RingTimeoutSeconds, &e.UpdatedAt, &e.MobilePasswordEnc)
 	return e, notFound(err)
+}
+
+func (p *Postgres) SetMobilePassword(ctx context.Context, number string, enc []byte) error {
+	tag, err := p.pool.Exec(ctx, `UPDATE extensions SET mobile_password_enc=$2, updated_at=now() WHERE number=$1`, number, enc)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (p *Postgres) GetExtension(ctx context.Context, number string) (Extension, error) {

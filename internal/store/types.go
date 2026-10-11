@@ -20,8 +20,10 @@ type Extension struct {
 	// SIPUsername は REGISTER の AOR ユーザー部
 	SIPUsername     string
 	SIPAuthUsername string
-	// SIPPasswordEnc はサーバー鍵で暗号化した SIP パスワード
+	// SIPPasswordEnc はサーバー鍵で暗号化した SIP パスワード（MikoPBX の内線のパスワード）
 	SIPPasswordEnc []byte
+	// MobilePasswordEnc は中継モードで iPhone が中継用 Asterisk に登録するためのパスワード（暗号化済み）
+	MobilePasswordEnc []byte
 	// Endpoint は端末レッグを発呼する PJSIP エンドポイント名（通常は内線番号）
 	Endpoint           string
 	RingTimeoutSeconds int
@@ -102,6 +104,7 @@ type HistoryItem struct {
 // Store は永続化の境界。本番は PostgreSQL、試験はメモリ実装を使う。
 type Store interface {
 	UpsertExtension(ctx context.Context, e Extension) error
+	SetMobilePassword(ctx context.Context, number string, enc []byte) error
 	GetExtension(ctx context.Context, number string) (Extension, error)
 	ListExtensions(ctx context.Context) ([]Extension, error)
 

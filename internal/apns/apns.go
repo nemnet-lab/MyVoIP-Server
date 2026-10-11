@@ -77,6 +77,12 @@ func New(key *ecdsa.PrivateKey, keyID, teamID, bundleID string) *Client {
 	}
 }
 
+// WithEndpoint は送信先を上書きする（試験用の APNs 互換サーバー）。空なら Apple に送る。
+func (c *Client) WithEndpoint(endpoint string) *Client {
+	c.hostOverride = endpoint
+	return c
+}
+
 // providerToken は ES256 の JWT。Apple の推奨に従い 20〜60 分で更新する。
 func (c *Client) providerToken(force bool) (string, error) {
 	c.mu.Lock()
