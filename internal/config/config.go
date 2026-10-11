@@ -93,7 +93,7 @@ func Load(requireRuntime bool) (Config, error) {
 		EnrollmentCodeTTL: 10 * time.Minute,
 		HistoryRetention:  180 * 24 * time.Hour,
 
-		TestCallSound: env("TEST_CALL_SOUND", "sound:hello-world"),
+		TestCallSound: env("TEST_CALL_SOUND", "sound:vm-intro"),
 	}
 
 	var errs []string

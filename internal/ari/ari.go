@@ -40,6 +40,9 @@ type Channel struct {
 type Playback struct {
 	ID        string `json:"id"`
 	TargetURI string `json:"target_uri"`
+	MediaURI  string `json:"media_uri"`
+	// State は queued / playing / done / failed など
+	State string `json:"state"`
 }
 
 type Recording struct {

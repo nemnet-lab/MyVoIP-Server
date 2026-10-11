@@ -156,7 +156,7 @@ func newFixture(t *testing.T, ring time.Duration) *fixture {
 	d, _ = st.GetDevice(ctx, "d-1")
 	f := &fixture{t: t, store: st, ari: &fakeARI{}, push: &fakePusher{sent: make(chan struct{}, 4)}, device: d}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	f.ctrl = New(st, f.ari, f.push, logger, Options{RingTimeout: ring, ContactWait: 300 * time.Millisecond})
+	f.ctrl = New(st, f.ari, f.push, logger, Options{RingTimeout: ring, ContactWait: 300 * time.Millisecond, TestPromptLimit: 300 * time.Millisecond})
 	return f
 }
 
@@ -423,6 +423,33 @@ func TestTestCallRecordingFailureEndsGracefully(t *testing.T) {
 	}
 }
 
+// ガイダンスの終了通知が来なくても（音声ファイルがない場合など）録音へ進む
+func TestTestCallProceedsWhenPromptNeverFinishes(t *testing.T) {
+	f := newFixture(t, 30*time.Second)
+	id, _ := f.ctrl.StartTestCall(context.Background(), f.device)
+	<-f.push.sent
+	f.ctrl.HandleEvent(ari.Event{Type: "ContactStatusChange", Endpoint: &ari.EndpointInfo{Resource: "201"},
+		ContactInfo: &ari.ContactInfo{URI: "sip:201@100.100.56.35:1;myvoip-reg=p1", ContactStatus: "Reachable"}})
+	_, _ = f.ctrl.Ready(context.Background(), "d-1", id, "p1")
+	devCh := "myvoip-dev-" + id
+	waitFor(t, func() bool { return f.ari.has("dial " + devCh) })
+	f.ctrl.HandleEvent(ari.Event{Type: "ChannelStateChange", Channel: &ari.Channel{ID: devCh, State: "Up"}})
+	waitFor(t, func() bool { return f.ari.has("record " + devCh) })
+	// 遅れて届いた終了通知で二重に録音しない
+	f.ctrl.HandleEvent(ari.Event{Type: "PlaybackFinished", Playback: &ari.Playback{ID: testPlaybackID(id, 1), State: "failed"}})
+	f.ari.mu.Lock()
+	records := 0
+	for _, op := range f.ari.ops {
+		if strings.HasPrefix(op, "record ") {
+			records++
+		}
+	}
+	f.ari.mu.Unlock()
+	if records != 1 {
+		t.Fatalf("recorded %d times", records)
+	}
+}
+
 func TestDeclineAndBusy(t *testing.T) {
 	f := newFixture(t, 30*time.Second)
 	id := f.incoming("caller-6")
@@ -498,7 +525,7 @@ func TestTestCallPlaysRecordsAndEnds(t *testing.T) {
 		t.Fatalf("test call must target the contact from the event, ops=%v", f.ari.ops)
 	}
 	f.ctrl.HandleEvent(ari.Event{Type: "ChannelStateChange", Channel: &ari.Channel{ID: devCh, State: "Up"}})
-	if !f.ari.has("play " + devCh + " sound:hello-world") {
+	if !f.ari.has("play " + devCh + " sound:vm-intro") {
 		t.Fatal("prompt not played")
 	}
 	f.ctrl.HandleEvent(ari.Event{Type: "PlaybackFinished", Playback: &ari.Playback{ID: testPlaybackID(id, 1)}})

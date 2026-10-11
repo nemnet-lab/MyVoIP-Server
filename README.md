@@ -130,7 +130,7 @@ docker compose exec myvoip myvoip-server enroll-code --extension 201
 アプリの「設定 → 接続を確認」で確認を実行し、「テスト着信を受ける」を押します。
 
 1. サーバーが VoIP Push を送り、iPhone に着信画面が出る（画面ロック中・アプリ終了後でも）
-2. 応答すると、ガイダンス音声（`TEST_CALL_SOUND`）が流れる
+2. 応答すると、ガイダンス音声（`TEST_CALL_SOUND`、既定は `sound:vm-intro`）が流れる。MikoPBX にない音声を指定すると何も流れず、ログに `playback failed` が出る（15秒後に次へ進む）
 3. ビープ音の後に4秒間話すと、その声がそのまま再生される（送話・受話の両方向を確認）
 4. 自動で終了する
 

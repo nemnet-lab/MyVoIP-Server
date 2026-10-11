@@ -84,6 +84,8 @@ type Options struct {
 	TestSound   string
 	// ContactWait は ready 後に Contact の登録を待つ上限
 	ContactWait time.Duration
+	// TestPromptLimit はテスト着信のガイダンスの終了を待つ上限
+	TestPromptLimit time.Duration
 }
 
 type Controller struct {
@@ -111,6 +113,8 @@ type active struct {
 	bridgeID       string
 	timer          *time.Timer
 	testTimer      *time.Timer
+	// testStep はテスト着信の進み具合（1: ガイダンス 2: 録音 3: 録音の再生）
+	testStep int
 }
 
 func New(st store.Store, a ARI, p Pusher, log *slog.Logger, opts Options) *Controller {
@@ -121,7 +125,10 @@ func New(st store.Store, a ARI, p Pusher, log *slog.Logger, opts Options) *Contr
 		opts.ContactWait = 3 * time.Second
 	}
 	if opts.TestSound == "" {
-		opts.TestSound = "sound:hello-world"
+		opts.TestSound = "sound:vm-intro"
+	}
+	if opts.TestPromptLimit == 0 {
+		opts.TestPromptLimit = 15 * time.Second
 	}
 	return &Controller{
 		store: st, ari: a, push: p, log: log, opts: opts,
@@ -225,6 +232,9 @@ func (c *Controller) HandleEvent(ev ari.Event) {
 		}
 	case "PlaybackFinished":
 		if ev.Playback != nil {
+			if ev.Playback.State == "failed" {
+				c.log.Warn("playback failed (sound file missing?)", "playback_id", ev.Playback.ID, "media", ev.Playback.MediaURI)
+			}
 			c.onPlaybackFinished(ev.Playback.ID)
 		}
 	case "RecordingFinished", "RecordingFailed":
@@ -592,15 +602,21 @@ func (c *Controller) onDeviceAnswered(callID, channelID string) {
 	a.bridgeID = bridgeID
 	if isTest {
 		// テスト着信は最長40秒で終える
+		a.testStep = 1
 		a.testTimer = time.AfterFunc(40*time.Second, func() { c.endByID(callID, ReasonCompleted) })
+		// ガイダンスの終了通知が来なくても（音声ファイルがない場合など）録音へ進む
+		time.AfterFunc(c.opts.TestPromptLimit, func() {
+			c.log.Warn("test prompt did not finish in time; continuing to recording", "call_id", callID)
+			c.advanceTestToRecording(callID)
+		})
 	}
 	c.mu.Unlock()
 
 	c.log.Info("device answered", "call_id", callID)
 	if isTest {
 		if err := c.ari.Play(ctx, channelID, c.opts.TestSound, testPlaybackID(callID, 1)); err != nil {
-			c.log.Warn("test prompt failed", "error", err)
-			c.startTestRecording(callID, channelID)
+			c.log.Warn("test prompt failed", "error", err, "media", c.opts.TestSound)
+			c.advanceTestToRecording(callID)
 		}
 		return
 	}
@@ -807,22 +823,26 @@ func (c *Controller) onPlaybackFinished(playbackID string) {
 		return
 	}
 	callID, step := rest[:idx], rest[idx+1:]
-	c.mu.Lock()
-	a := c.calls[callID]
-	var channelID string
-	if a != nil {
-		channelID = a.call.DeviceChannel
-	}
-	c.mu.Unlock()
-	if a == nil {
-		return
-	}
 	switch step {
 	case "1":
-		c.startTestRecording(callID, channelID)
+		c.advanceTestToRecording(callID)
 	case "2":
 		c.endByID(callID, ReasonCompleted)
 	}
+}
+
+// advanceTestToRecording はテスト着信をガイダンスから録音へ1回だけ進める。
+func (c *Controller) advanceTestToRecording(callID string) {
+	c.mu.Lock()
+	a := c.calls[callID]
+	if a == nil || a.testStep != 1 || a.call.State != StateConnected {
+		c.mu.Unlock()
+		return
+	}
+	a.testStep = 2
+	channelID := a.call.DeviceChannel
+	c.mu.Unlock()
+	c.startTestRecording(callID, channelID)
 }
 
 func (c *Controller) startTestRecording(callID, channelID string) {
