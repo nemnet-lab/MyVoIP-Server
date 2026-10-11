@@ -134,6 +134,8 @@ docker compose exec myvoip myvoip-server enroll-code --extension 201
 3. ビープ音の後に4秒間話すと、その声がそのまま再生される（送話・受話の両方向を確認）
 4. 自動で終了する
 
+声の折り返し（手順3）には、Asterisk の ARI 録音の保存先 `<astspooldir>/recording` が必要です。ない場合はガイダンスのあと少し待って終了します（受話の確認はできますが、送話は確認できません）。MikoPBX 2024.1 では `astspooldir` が `/storage/usbdisk1/mikopbx/astspool` などになっているので、その下に `recording` ディレクトリを作ってください。テストの録音はサーバーが終了時に削除します。
+
 着信しない・音声が出ないときは [9. トラブルシューティング](#9-トラブルシューティング)へ。
 
 ## MikoPBX 2024.1 での ARI の有効化
@@ -219,6 +221,7 @@ docker compose build myvoip         # イメージのビルド
 | `voip push failed ... BadDeviceToken` | アプリの APNs 環境とキーの環境の不一致（TestFlight は本番） |
 | `registered contact not found` | iPhone が MikoPBX に登録できていない。iPhone が LAN・VPN につながっているか、`SIP_DOMAIN`・`SIP_TRANSPORT`・ポート、内線の SIP パスワード。登録はできているのに出る場合は、ログに `ARI subscribed source=endpoint:PJSIP` と `contact status` が出ているか |
 | 応答後に無音・片通話 | MikoPBX の RTP ポートへの到達性（VPN の経路・ファイアウォール）、MikoPBX の NAT 設定 |
+| テスト着信でガイダンスのあと声が返らずに終わる | ログに `test recording failed`。MikoPBX の `<astspooldir>/recording` を作る |
 | `SIP_SRTP=mandatory` で通話できない | MikoPBX 側で SRTP が有効か。不要なら `optional` にする |
 | アプリで登録時に通信できない | iPhone から `MYVOIP_PUBLIC_URL` に届くか（LAN・VPN の接続）。初回は iPhone の「ローカルネットワーク」許可を求められるので許可する |
 | API が 403 `client_not_allowed` | `MYVOIP_ALLOWED_CLIENT_CIDRS` の範囲外から接続している（ログの `client` を確認）。Tailnet 経由で接続しているか |

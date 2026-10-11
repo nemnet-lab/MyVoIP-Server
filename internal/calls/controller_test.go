@@ -17,11 +17,12 @@ import (
 
 // fakeARI は ARI 呼び出しを記録し、Contact を返す。
 type fakeARI struct {
-	mu       sync.Mutex
-	ops      []string
-	contacts string // 発信側チャネル上で評価した PJSIP_DIAL_CONTACTS の値
-	state    string // エンドポイントの状態
-	failDial bool
+	mu         sync.Mutex
+	ops        []string
+	contacts   string // 発信側チャネル上で評価した PJSIP_DIAL_CONTACTS の値
+	state      string // エンドポイントの状態
+	failDial   bool
+	failRecord bool
 }
 
 func (f *fakeARI) record(op string) {
@@ -99,6 +100,9 @@ func (f *fakeARI) Play(_ context.Context, ch, media, id string) error {
 }
 func (f *fakeARI) Record(_ context.Context, ch, name string, max int) error {
 	f.record("record " + ch + " " + name)
+	if f.failRecord {
+		return fmt.Errorf("Unrecognized recording error: No such file or directory")
+	}
 	return nil
 }
 func (f *fakeARI) DeleteStoredRecording(_ context.Context, name string) error {
@@ -223,7 +227,7 @@ func TestIncomingAnsweredAndCompleted(t *testing.T) {
 		t.Fatalf("duplicate ready changed state: %s", st2.State)
 	}
 
-	f.ctrl.HandleEvent(ari.Event{Type: "StasisStart", Args: []string{"device", id}, Channel: &ari.Channel{ID: devCh}})
+	f.ctrl.HandleEvent(ari.Event{Type: "ChannelStateChange", Channel: &ari.Channel{ID: devCh, State: "Up"}})
 	if f.status(id).State != StateConnected {
 		t.Fatal("should be connected")
 	}
@@ -281,7 +285,7 @@ func TestLateDeviceAnswerAfterEndIsHungUp(t *testing.T) {
 	waitFor(t, func() bool { return f.ari.has("dial " + devCh) })
 	f.ctrl.HandleEvent(ari.Event{Type: "ChannelDestroyed", Channel: &ari.Channel{ID: "caller-3"}})
 	// 取消直後に端末が応答しても接続しない
-	f.ctrl.HandleEvent(ari.Event{Type: "StasisStart", Args: []string{"device", id}, Channel: &ari.Channel{ID: devCh}})
+	f.ctrl.HandleEvent(ari.Event{Type: "ChannelStateChange", Channel: &ari.Channel{ID: devCh, State: "Up"}})
 	if f.ari.has("answer caller-3") {
 		t.Fatal("must not answer cancelled caller")
 	}
@@ -361,6 +365,64 @@ func TestTestCallFailsWhenEndpointOffline(t *testing.T) {
 	}
 }
 
+// /channels/create の端末レッグは作成時に Stasis へ入る。これを応答とみなしてはいけない
+func TestDeviceStasisStartIsNotAnswer(t *testing.T) {
+	f := newFixture(t, 30*time.Second)
+	id := f.incoming("caller-20")
+	f.ari.contacts = "PJSIP/201/sip:201@10.0.0.5:5060;myvoip-reg=s1"
+	_, _ = f.ctrl.Ready(context.Background(), "d-1", id, "s1")
+	devCh := "myvoip-dev-" + id
+	waitFor(t, func() bool { return f.ari.has("dial " + devCh) })
+	f.ctrl.HandleEvent(ari.Event{Type: "StasisStart", Args: []string{"device", id}, Channel: &ari.Channel{ID: devCh, State: "Down"}})
+	if f.status(id).State == StateConnected || f.ari.has("answer caller-20") {
+		t.Fatal("StasisStart of the device leg must not answer the caller")
+	}
+	// Dial の ANSWER でも応答として扱い、ChannelStateChange と重なっても二重にブリッジしない
+	f.ctrl.HandleEvent(ari.Event{Type: "Dial", DialStatus: "ANSWER", Peer: &ari.Channel{ID: devCh}})
+	f.ctrl.HandleEvent(ari.Event{Type: "ChannelStateChange", Channel: &ari.Channel{ID: devCh, State: "Up"}})
+	if f.status(id).State != StateConnected {
+		t.Fatal("should be connected after answer")
+	}
+	f.ari.mu.Lock()
+	bridges := 0
+	for _, op := range f.ari.ops {
+		if strings.HasPrefix(op, "bridge ") {
+			bridges++
+		}
+	}
+	f.ari.mu.Unlock()
+	if bridges != 1 {
+		t.Fatalf("bridge created %d times", bridges)
+	}
+	// 発信側の Up（こちらが応答させたもの）は端末の応答として扱わない
+	f.ctrl.HandleEvent(ari.Event{Type: "ChannelStateChange", Channel: &ari.Channel{ID: "caller-20", State: "Up"}})
+}
+
+func TestTestCallRecordingFailureEndsGracefully(t *testing.T) {
+	f := newFixture(t, 30*time.Second)
+	f.ari.failRecord = true
+	id, _ := f.ctrl.StartTestCall(context.Background(), f.device)
+	<-f.push.sent
+	f.ctrl.HandleEvent(ari.Event{Type: "ContactStatusChange", Endpoint: &ari.EndpointInfo{Resource: "201"},
+		ContactInfo: &ari.ContactInfo{URI: "sip:201@100.100.56.35:1;myvoip-reg=x1", ContactStatus: "Reachable"}})
+	_, _ = f.ctrl.Ready(context.Background(), "d-1", id, "x1")
+	devCh := "myvoip-dev-" + id
+	waitFor(t, func() bool { return f.ari.has("dial " + devCh) })
+	f.ctrl.HandleEvent(ari.Event{Type: "ChannelStateChange", Channel: &ari.Channel{ID: devCh, State: "Up"}})
+	f.ctrl.HandleEvent(ari.Event{Type: "PlaybackFinished", Playback: &ari.Playback{ID: testPlaybackID(id, 1)}})
+	// すぐには切らない
+	if f.status(id).State == StateEnded {
+		t.Fatal("recording failure must not end the call immediately")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && f.status(id).State != StateEnded {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if st := f.status(id); st.State != StateEnded || *st.EndReason != ReasonCompleted {
+		t.Fatalf("expected completed, got %+v", st)
+	}
+}
+
 func TestDeclineAndBusy(t *testing.T) {
 	f := newFixture(t, 30*time.Second)
 	id := f.incoming("caller-6")
@@ -435,7 +497,7 @@ func TestTestCallPlaysRecordsAndEnds(t *testing.T) {
 	if !f.ari.has("create PJSIP/201/sip:201@100.100.56.35:54482;myvoip-reg=t1 device," + id) {
 		t.Fatalf("test call must target the contact from the event, ops=%v", f.ari.ops)
 	}
-	f.ctrl.HandleEvent(ari.Event{Type: "StasisStart", Args: []string{"device", id}, Channel: &ari.Channel{ID: devCh}})
+	f.ctrl.HandleEvent(ari.Event{Type: "ChannelStateChange", Channel: &ari.Channel{ID: devCh, State: "Up"}})
 	if !f.ari.has("play " + devCh + " sound:hello-world") {
 		t.Fatal("prompt not played")
 	}

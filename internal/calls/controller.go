@@ -195,7 +195,8 @@ func (c *Controller) HandleEvent(ev ari.Event) {
 			return
 		}
 		if len(ev.Args) >= 2 && ev.Args[0] == "device" {
-			c.onDeviceAnswered(ev.Args[1], ev.Channel.ID)
+			// /channels/create で作った端末レッグは、発呼前（作成時）に Stasis へ入る。応答ではない
+			c.onDeviceInStasis(ev.Args[1], ev.Channel.ID)
 			return
 		}
 		ext := ev.Channel.Dialplan.Exten
@@ -208,8 +209,19 @@ func (c *Controller) HandleEvent(ev ari.Event) {
 			c.onChannelGone(ev.Channel.ID, ev.Cause, ev.Type == "ChannelDestroyed")
 		}
 	case "ChannelStateChange":
-		if ev.Channel != nil && ev.Channel.State == "Ringing" {
+		if ev.Channel == nil {
+			return
+		}
+		switch ev.Channel.State {
+		case "Ringing":
 			c.onDeviceRinging(ev.Channel.ID)
+		case "Up":
+			// 端末が応答した（端末レッグのチャネルが Up になった）
+			c.onDeviceUp(ev.Channel.ID)
+		}
+	case "Dial":
+		if ev.Peer != nil && ev.DialStatus == "ANSWER" {
+			c.onDeviceUp(ev.Peer.ID)
 		}
 	case "PlaybackFinished":
 		if ev.Playback != nil {
@@ -527,11 +539,41 @@ func (c *Controller) onDeviceRinging(channelID string) {
 }
 
 // onDeviceAnswered は端末レッグの応答（Stasis 入り）。発信側へ最終応答してブリッジする（03 §5.8）。
+// onDeviceInStasis は端末レッグが Stasis に入った（作成直後）。終了済みの呼なら切る。
+func (c *Controller) onDeviceInStasis(callID, channelID string) {
+	c.mu.Lock()
+	a := c.calls[callID]
+	alive := a != nil && a.call.State != StateEnded && a.call.DeviceChannel == channelID
+	c.mu.Unlock()
+	if !alive {
+		ctx, cancel := ctxTimeout()
+		defer cancel()
+		_ = c.ari.Hangup(ctx, channelID, "normal")
+	}
+}
+
+// onDeviceUp は端末レッグのチャネルが Up になった（端末が応答した）。
+func (c *Controller) onDeviceUp(channelID string) {
+	c.mu.Lock()
+	callID := c.byChannel[channelID]
+	a := c.calls[callID]
+	isDevice := a != nil && a.call.DeviceChannel == channelID
+	c.mu.Unlock()
+	if isDevice {
+		c.onDeviceAnswered(callID, channelID)
+	}
+}
+
 func (c *Controller) onDeviceAnswered(callID, channelID string) {
 	ctx, cancel := ctxTimeout()
 	defer cancel()
 	c.mu.Lock()
 	a := c.calls[callID]
+	if a != nil && a.call.State == StateConnected && a.call.DeviceChannel == channelID {
+		// ChannelStateChange と Dial の両方で届くため、2回目は何もしない
+		c.mu.Unlock()
+		return
+	}
 	if a == nil || a.call.State == StateEnded || a.call.DeviceChannel != channelID {
 		c.mu.Unlock()
 		// 既に終了した呼へ接続しない
@@ -787,8 +829,10 @@ func (c *Controller) startTestRecording(callID, channelID string) {
 	ctx, cancel := ctxTimeout()
 	defer cancel()
 	if err := c.ari.Record(ctx, channelID, testRecordingName(callID), 4); err != nil {
-		c.log.Warn("test recording failed", "call_id", callID, "error", err)
-		c.endByID(callID, ReasonCompleted)
+		// 録音できなくても受話（ガイダンス）は確認できているので、少し待ってから正常に終える。
+		// ARI の録音には <astspooldir>/recording が必要
+		c.log.Warn("test recording failed; ending test call without echo", "call_id", callID, "error", err)
+		time.AfterFunc(3*time.Second, func() { c.endByID(callID, ReasonCompleted) })
 	}
 }
 
