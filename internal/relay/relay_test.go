@@ -33,6 +33,7 @@ func TestRenderRelayConfig(t *testing.T) {
 		"allow=alaw,ulaw",
 		"identify_by=ip", // PBX 側のエンドポイントはユーザー名では一致させない
 		"qualify_frequency=30",
+		"rtp_timeout=60", // 強制終了などで BYE が届かなかった通話を残さない
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q", want)

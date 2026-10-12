@@ -25,6 +25,10 @@ import (
 	"github.com/nemnet-lab/MyVoIP-Server/internal/store"
 )
 
+// mobileRTPTimeout は、iPhone からの音声が途絶えた通話を切るまでの秒数。
+// 回線切り替えでの一時的な途絶（アプリの再接続は最長10秒）より十分長くする。
+const mobileRTPTimeout = 60
+
 // FileName は pjsip.conf から #tryinclude される生成ファイル。
 const FileName = "pjsip_myvoip.conf"
 
@@ -174,10 +178,12 @@ func renderExtension(out *strings.Builder, e store.Extension, box *secret.Box, o
 	if opts.SRTP == "mandatory" {
 		encryption = "sdes"
 	}
+	// アプリが通話中に強制終了されるなどして BYE が届かなかったときに、PBX 側の通話を残さないよう、
+	// 音声が届かなくなった通話を切る（保留中は対象外。ミュート中もアプリは無音を送り続ける）
 	fmt.Fprintf(&b, "[%s]\ntype=endpoint\ntransport=transport-udp\ncontext=from-mobile\ndisallow=all\nallow=alaw,ulaw\n"+
 		"auth=%s\naors=%s\ndirect_media=no\nrtp_symmetric=yes\nforce_rport=yes\nrewrite_contact=yes\n"+
-		"dtmf_mode=rfc4733\nmedia_encryption=%s\nset_var=MYVOIP_EXT=%s\n",
-		e.Number, e.Number, e.Number, encryption, e.Number)
+		"dtmf_mode=rfc4733\nmedia_encryption=%s\nrtp_timeout=%d\nset_var=MYVOIP_EXT=%s\n",
+		e.Number, e.Number, e.Number, encryption, mobileRTPTimeout, e.Number)
 	if len(opts.AllowedClients) > 0 {
 		b.WriteString("deny=0.0.0.0/0.0.0.0\ndeny=::/0\n")
 		for _, p := range opts.AllowedClients {
