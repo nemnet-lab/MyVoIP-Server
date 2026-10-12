@@ -186,6 +186,7 @@ docker compose exec myvoip myvoip-server enroll-code --extension 201
 | 登録コードを発行 | アプリに入力する設定 URL・登録コード（10分・1回限り）と QR を表示する。機種変更のときも再発行する |
 | 内線の設定の変更・削除 | SIP の設定の変更（パスワードは変えるときだけ入力）。削除すると端末・履歴・登録コードも消え、PBX への登録もやめる |
 | PBX への接続状態 | 中継用 Asterisk から PBX に届いているか（30秒ごとの OPTIONS）を iPhone ごとに表示する |
+| 保留音 | 自分の保留音（WAV・MP3、20MB・`MYVOIP_MOH_MAX_SECONDS` 秒まで、`MYVOIP_MOH_MAX_FILES_PER_USER` 個まで）を登録し、iPhone ごとに割り当てる。iPhone で保留したとき、相手にその保留音が流れる。割り当てていない iPhone は標準の保留音 |
 | サポート用パスコード | 数字8桁（`SUPPORT_PASSCODE_MINUTES`、既定30分・1回限り）。管理者に伝えると、管理者が `SUPPORT_SESSION_MINUTES`（既定60分）だけ利用者の画面を開いて、PBX や iPhone の設定を代わりに操作できる。管理者の操作は利用者の画面の「操作の記録」に表示される |
 
 管理者（`MYVOIP_ADMIN_DISCORD_IDS`）は「管理」画面で、サポートの開始、利用者のログイン停止、管理コマンドで登録した内線（例 9002）の利用者への割り当て・解除ができます。
@@ -193,6 +194,14 @@ docker compose exec myvoip myvoip-server enroll-code --extension 201
 - 別々の PBX に同じ内線番号（例 201）があっても使えます。サーバーは内線ごとに `mv` で始まる識別子を振り、中継用 Asterisk のエンドポイント名と iPhone の SIP ユーザー名に使います。アプリには PBX での内線番号を表示します。
 - PBX からの着信は、登録時の `line` パラメーターだけでどの内線かを見分けます（PBX 側のエンドポイントは `identify_by=ip`）。ほかの利用者が SIP のユーザー名をまねて、別の利用者の iPhone に着信させることはできません。
 - 1人の利用者の設定に誤りがあっても、ほかの利用者の内線は登録されます（その内線だけを書かずに、ログに `relay: extension not registered to PBX` を出します）。
+
+**保留音**
+
+- iPhone で保留すると、中継用 Asterisk が相手（PBX 側）に保留音を流します。iPhone 用のエンドポイントの `moh_suggest` に、割り当てた保留音のクラス（`myvoip-moh-<保留音の ID>`）を指定します。
+- アップロードされた WAV（PCM 8/16/24/32bit・浮動小数点）と MP3 を、サーバー内で 8kHz・モノラル・16bit の WAV に変換し（低域通過フィルターで折り返し雑音を除き、音量を -1dBFS にそろえる）、データベースに保存します。M4A・AAC などは受け付けません。外部のコマンドは使いません。
+- 中継用 Asterisk には、共有ボリュームの `moh/<保留音の ID>/hold.wav` と `musiconhold_myvoip.conf` として書き出します。ファイル名・クラス名には ID だけを使い、利用者が付けた名前は使いません。
+- **他人の保留音は扱えません**。試聴・削除・割り当てのどの操作も、保留音の持ち主がログイン中の本人であることを確かめ、違えば 404 を返します（存在するかも分からない）。内線への割り当ては、データベースでも「内線の持ち主と保留音の持ち主が同じ」ときだけ行います。管理者がサポートで利用者の画面を開いているときは、一覧・割り当て・追加・削除はできますが、試聴はできません。ログには利用者が付けた名前やファイル名を出しません。
+- 内線の割り当てを解除すると、その内線の保留音の割り当ても外します（次の利用者に引き継がない）。
 
 **利用者の PBX に必要な設定**
 
@@ -279,6 +288,7 @@ Stasis(myvoip,201)
 | 端末一覧 | `docker compose exec myvoip myvoip-server devices` |
 | 端末の失効 | `docker compose exec myvoip myvoip-server revoke-device --device d-xxxx` |
 | 更新 | `docker compose up -d --build`（すべて）。myvoip だけなら `docker compose up -d --build --no-deps myvoip`（中継用 Asterisk を再起動しない。中継用 Asterisk の再起動は通話が切れるので、通話のない時間に行う） |
+| 中継用 Asterisk のイメージの更新が必要な変更（`asterisk/` 以下。例：保留音の設定 `musiconhold.conf` の追加） | `docker compose up -d --build asterisk`（中継用 Asterisk が再起動し、通話が切れる。通話のない時間に行う） |
 | 中継用 Asterisk の設定を反映し直す | `docker compose exec myvoip myvoip-server relay sync`（通話は切れない） |
 | バックアップ | `docker compose exec -T db pg_dump -U myvoip myvoip \| gzip > backup-$(date +%F).sql.gz`（`.env` と `secrets/` も別途保管） |
 

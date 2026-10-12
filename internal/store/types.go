@@ -39,6 +39,19 @@ type Extension struct {
 	// Label は利用者が付けた iPhone の名前
 	Label      string
 	AssignedAt *time.Time
+	// MOHFileID は割り当てた保留音（空なら標準の保留音）。持ち主の保留音だけを割り当てられる
+	MOHFileID string
+}
+
+// MOHFile は利用者の保留音（8kHz・モノラル・16bit の WAV）。Data は GetMOHData でだけ読む。
+type MOHFile struct {
+	ID          string
+	OwnerUserID string
+	Name        string
+	DurationMS  int
+	SizeBytes   int
+	CreatedAt   time.Time
+	Data        []byte
 }
 
 // User は Web 管理画面に Discord でログインする利用者。
@@ -227,6 +240,20 @@ type Store interface {
 	DeleteSupportPasscode(ctx context.Context, userID string) error
 	// ConsumeSupportPasscode は有効なパスコードを消して、その利用者を返す。
 	ConsumeSupportPasscode(ctx context.Context, codeHash string, now time.Time) (string, error)
+
+	// CreateMOH は保留音を登録する。利用者の保留音が max 以上なら ErrLimit。
+	CreateMOH(ctx context.Context, m MOHFile, max int) error
+	// GetMOH は保留音の情報を返す（音声は含まない）。
+	GetMOH(ctx context.Context, id string) (MOHFile, error)
+	GetMOHData(ctx context.Context, id string) ([]byte, error)
+	ListMOHByOwner(ctx context.Context, userID string) ([]MOHFile, error)
+	// ListAllMOH はすべての保留音の情報を返す（中継用 Asterisk への書き出し用。音声は含まない）。
+	ListAllMOH(ctx context.Context) ([]MOHFile, error)
+	// DeleteMOH は保留音を消す（割り当てていた内線は標準の保留音に戻る）。
+	DeleteMOH(ctx context.Context, id string) error
+	// SetExtensionMOH は内線に保留音を割り当てる（mohID が空なら標準に戻す）。
+	// 内線の持ち主の保留音でなければ ErrNotFound（他人の保留音は割り当てられない）。
+	SetExtensionMOH(ctx context.Context, number, mohID string) error
 
 	AddAudit(ctx context.Context, a AuditEntry) error
 	ListAudit(ctx context.Context, userID string, limit int) ([]AuditEntry, error)

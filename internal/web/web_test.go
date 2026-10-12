@@ -1,10 +1,14 @@
 package web
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"math"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -102,6 +106,7 @@ func newHarness(t *testing.T, roles []string) *harness {
 			DiscordGuildID: "guild-1", DiscordRoleIDs: roles, AdminIDs: []string{"admin"},
 			AllowedPBX:       []netip.Prefix{netip.MustParsePrefix("100.64.0.0/10")},
 			MaxPhonesPerUser: 2, SessionTTL: time.Hour, SupportCodeTTL: 30 * time.Minute, SupportSessionTTL: time.Hour,
+			MOHMaxFiles: 2, MOHMaxDuration: 30 * time.Second,
 		},
 		DiscordAPI: ds.URL, DiscordAuthorizeURL: "https://discord.example/oauth2/authorize",
 	}, syncer, log)
@@ -140,10 +145,14 @@ func (c *client) do(method, path string, form url.Values) *httptest.ResponseReco
 		body = strings.NewReader(form.Encode())
 	}
 	req := httptest.NewRequest(method, path, body)
-	req.RemoteAddr = "127.0.0.1:50000"
 	if form != nil {
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	}
+	return c.send(req)
+}
+
+func (c *client) send(req *http.Request) *httptest.ResponseRecorder {
+	req.RemoteAddr = "127.0.0.1:50000"
 	for _, ck := range c.cookies {
 		req.AddCookie(ck)
 	}
@@ -628,5 +637,204 @@ func TestSecurityHeaders(t *testing.T) {
 	}
 	if rec := h.browser().do(http.MethodGet, "/static/app.css", nil); rec.Code != http.StatusOK {
 		t.Fatalf("/static/app.css -> %d", rec.Code)
+	}
+}
+
+// --- 保留音
+
+// sineWAV は 8kHz・モノラル・16bit の正弦波の WAV を作る。
+func sineWAV(seconds float64) []byte {
+	n := int(8000 * seconds)
+	b := make([]byte, 44+n*2)
+	copy(b[0:], "RIFF")
+	binary.LittleEndian.PutUint32(b[4:], uint32(36+n*2))
+	copy(b[8:], "WAVEfmt ")
+	binary.LittleEndian.PutUint32(b[16:], 16)
+	binary.LittleEndian.PutUint16(b[20:], 1)
+	binary.LittleEndian.PutUint16(b[22:], 1)
+	binary.LittleEndian.PutUint32(b[24:], 8000)
+	binary.LittleEndian.PutUint32(b[28:], 16000)
+	binary.LittleEndian.PutUint16(b[32:], 2)
+	binary.LittleEndian.PutUint16(b[34:], 16)
+	copy(b[36:], "data")
+	binary.LittleEndian.PutUint32(b[40:], uint32(n*2))
+	for i := 0; i < n; i++ {
+		v := int16(8000 * math.Sin(2*math.Pi*440*float64(i)/8000))
+		binary.LittleEndian.PutUint16(b[44+i*2:], uint16(v))
+	}
+	return b
+}
+
+func (c *client) upload(path, name, filename string, data []byte) *httptest.ResponseRecorder {
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	_ = mw.WriteField("csrf", c.csrf)
+	_ = mw.WriteField("name", name)
+	fw, _ := mw.CreateFormFile("file", filename)
+	_, _ = fw.Write(data)
+	_ = mw.Close()
+	req := httptest.NewRequest(http.MethodPost, path, &body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	return c.send(req)
+}
+
+func (h *harness) holdMusic(discordID string) []store.MOHFile {
+	h.t.Helper()
+	list, err := h.st.ListMOHByOwner(context.Background(), h.userByDiscord(discordID).ID)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return list
+}
+
+func TestHoldMusicIsPrivateToItsOwner(t *testing.T) {
+	h := newHarness(t, nil)
+	ctx := context.Background()
+	alice, bob := h.browser(), h.browser()
+	alice.login("alice")
+	bob.login("bob")
+	alice.setPBX("100.64.0.21")
+	bob.setPBX("100.64.0.22")
+	alice.addPhone("仕事用", "201", "pw")
+	bob.addPhone("bob", "201", "pw")
+	if rec := alice.upload("/moh", "アリスの曲", "song.wav", sineWAV(3)); rec.Header().Get("Location") != "/?m=moh_added" {
+		t.Fatalf("upload -> %d %s", rec.Code, rec.Body.String())
+	}
+	moh := h.holdMusic("alice")
+	if len(moh) != 1 || moh[0].Name != "アリスの曲" || moh[0].DurationMS < 2900 || moh[0].DurationMS > 3100 {
+		t.Fatalf("moh = %+v", moh)
+	}
+	id := moh[0].ID
+	aliceLine, bobLine := h.phones("alice")[0].Number, h.phones("bob")[0].Number
+
+	// 本人は試聴できる（範囲指定の取得にも応じる）
+	rec := alice.do(http.MethodGet, "/moh/"+id+"/audio", nil)
+	if rec.Code != http.StatusOK || rec.Header().Get("Content-Type") != "audio/wav" || !bytes.HasPrefix(rec.Body.Bytes(), []byte("RIFF")) {
+		t.Fatalf("owner audio -> %d %q", rec.Code, rec.Header().Get("Content-Type"))
+	}
+	req := httptest.NewRequest(http.MethodGet, "/moh/"+id+"/audio", nil)
+	req.Header.Set("Range", "bytes=0-99")
+	if rec := alice.send(req); rec.Code != http.StatusPartialContent || rec.Body.Len() != 100 {
+		t.Fatalf("range -> %d len %d", rec.Code, rec.Body.Len())
+	}
+	// 他人は試聴・削除・割り当てのどれもできず、存在するかも分からない（404）
+	if rec := bob.do(http.MethodGet, "/moh/"+id+"/audio", nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("other user's audio -> %d", rec.Code)
+	}
+	if rec := bob.post("/moh/"+id+"/delete", nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("other user's delete -> %d", rec.Code)
+	}
+	if rec := bob.post("/phones/"+bobLine+"/moh", url.Values{"moh_id": {id}}); rec.Code != http.StatusNotFound {
+		t.Fatalf("assign other user's moh -> %d", rec.Code)
+	}
+	if rec := bob.post("/phones/"+aliceLine+"/moh", url.Values{"moh_id": {""}}); rec.Code != http.StatusNotFound {
+		t.Fatalf("change other user's phone -> %d", rec.Code)
+	}
+	if e, _ := h.st.GetExtension(ctx, bobLine); e.MOHFileID != "" {
+		t.Fatal("bob's phone got alice's hold music")
+	}
+	if page := bob.do(http.MethodGet, "/", nil).Body.String(); strings.Contains(page, "アリスの曲") || strings.Contains(page, id) {
+		t.Fatal("bob's page shows alice's hold music")
+	}
+	if len(h.holdMusic("alice")) != 1 {
+		t.Fatal("other user deleted the hold music")
+	}
+
+	// 本人は自分の iPhone に割り当てられ、中継用 Asterisk に書き出される
+	if rec := alice.post("/phones/"+aliceLine+"/moh", url.Values{"moh_id": {id}}); rec.Header().Get("Location") != "/?m=moh_saved" {
+		t.Fatalf("assign -> %d %s", rec.Code, rec.Body.String())
+	}
+	cfg := h.relayConfig()
+	if !strings.Contains(cfg, "moh_suggest="+relay.MOHClass(id)) || strings.Count(cfg, "moh_suggest=") != 1 {
+		t.Fatalf("relay config:\n%s", cfg)
+	}
+	if _, err := os.Stat(filepath.Join(h.relayDir, "moh", id, "hold.wav")); err != nil {
+		t.Fatal(err)
+	}
+	if page := alice.do(http.MethodGet, "/", nil).Body.String(); !strings.Contains(page, "保留音：アリスの曲") || !strings.Contains(page, `<audio controls preload="none" src="/moh/`+id+`/audio">`) {
+		t.Fatal("dashboard does not show the assigned hold music")
+	}
+
+	// 削除すると、割り当てた iPhone は標準の保留音に戻る
+	if rec := alice.post("/moh/"+id+"/delete", nil); rec.Header().Get("Location") != "/?m=moh_deleted" {
+		t.Fatalf("delete -> %d", rec.Code)
+	}
+	if e, _ := h.st.GetExtension(ctx, aliceLine); e.MOHFileID != "" {
+		t.Fatal("assignment remains after delete")
+	}
+	if strings.Contains(h.relayConfig(), "moh_suggest") {
+		t.Fatal("deleted hold music still configured")
+	}
+	if _, err := os.Stat(filepath.Join(h.relayDir, "moh", id)); !os.IsNotExist(err) {
+		t.Fatal("deleted hold music file remains")
+	}
+}
+
+func TestSupportCannotListenToHoldMusic(t *testing.T) {
+	h := newHarness(t, nil)
+	alice, admin := h.browser(), h.browser()
+	alice.login("alice")
+	admin.login("admin")
+	alice.setPBX("100.64.0.21")
+	alice.addPhone("仕事用", "201", "pw")
+	alice.upload("/moh", "曲", "a.wav", sineWAV(2))
+	id := h.holdMusic("alice")[0].ID
+	line := h.phones("alice")[0].Number
+	m := bigCodePattern.FindStringSubmatch(alice.post("/support-passcode", nil).Body.String())
+	admin.post("/admin/support", url.Values{"passcode": {m[1]}})
+
+	page := admin.do(http.MethodGet, "/support", nil).Body.String()
+	if !strings.Contains(page, "曲") || strings.Contains(page, "<audio") {
+		t.Fatal("support page must list hold music without a player")
+	}
+	if rec := admin.do(http.MethodGet, "/moh/"+id+"/audio", nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("admin audio in support -> %d", rec.Code)
+	}
+	// サポートでは割り当て・追加・削除はできる
+	if rec := admin.post("/support/phones/"+line+"/moh", url.Values{"moh_id": {id}}); rec.Header().Get("Location") != "/support?m=moh_saved" {
+		t.Fatalf("support assign -> %d", rec.Code)
+	}
+	if rec := admin.upload("/support/moh", "管理者が追加", "b.wav", sineWAV(2)); rec.Header().Get("Location") != "/support?m=moh_added" {
+		t.Fatalf("support upload -> %d %s", rec.Code, rec.Body.String())
+	}
+	if list := h.holdMusic("alice"); len(list) != 2 || len(h.holdMusic("admin")) != 0 {
+		t.Fatal("support upload went to the wrong user")
+	}
+	if !strings.Contains(alice.do(http.MethodGet, "/", nil).Body.String(), "保留音を変更") {
+		t.Fatal("support action not in the audit log")
+	}
+}
+
+func TestHoldMusicUploadIsValidated(t *testing.T) {
+	h := newHarness(t, nil)
+	c := h.browser()
+	c.login("alice")
+	for name, data := range map[string][]byte{
+		"text":      []byte("not audio"),
+		"too long":  sineWAV(31),
+		"too short": sineWAV(0.5),
+	} {
+		if rec := c.upload("/moh", name, "x.wav", data); rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s -> %d", name, rec.Code)
+		}
+	}
+	c.upload("/moh", "1", "1.wav", sineWAV(1.5))
+	c.upload("/moh", "2", "2.wav", sineWAV(1.5))
+	if rec := c.upload("/moh", "3", "3.wav", sineWAV(1.5)); rec.Code != http.StatusConflict {
+		t.Fatalf("over limit -> %d", rec.Code)
+	}
+	// 名前を省略するとファイル名を使う。名前の制御文字は除く
+	h2 := newHarness(t, nil)
+	d := h2.browser()
+	d.login("alice")
+	d.upload("/moh", "", "ロビー.wav", sineWAV(1.5))
+	d.upload("/moh", "受付\x07の曲", "x.mp3", sineWAV(1.5))
+	if list := h2.holdMusic("alice"); len(list) != 2 || list[0].Name != "ロビー" || list[1].Name != "受付の曲" {
+		t.Fatalf("names = %+v", list)
+	}
+	// CSRF トークンがなければ受け付けない
+	d.csrf = "wrong"
+	if rec := d.upload("/moh", "x", "x.wav", sineWAV(1.5)); rec.Code != http.StatusForbidden {
+		t.Fatalf("upload without csrf -> %d", rec.Code)
 	}
 }

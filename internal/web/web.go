@@ -8,6 +8,7 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -16,11 +17,13 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"io/fs"
 	"log/slog"
 	"math/big"
 	"net/http"
 	"net/netip"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +31,7 @@ import (
 
 	qrcode "github.com/skip2/go-qrcode"
 
+	"github.com/nemnet-lab/MyVoIP-Server/internal/audio"
 	"github.com/nemnet-lab/MyVoIP-Server/internal/config"
 	"github.com/nemnet-lab/MyVoIP-Server/internal/relay"
 	"github.com/nemnet-lab/MyVoIP-Server/internal/secret"
@@ -126,6 +130,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /phones/{number}/code", s.withUser(s.self(s.issueCode)))
 	mux.HandleFunc("POST /phones/{number}/rename", s.withUser(s.self(s.renamePhone)))
 	mux.HandleFunc("POST /phones/{number}/delete", s.withUser(s.self(s.deletePhone)))
+	mux.HandleFunc("POST /phones/{number}/moh", s.withUser(s.self(s.assignMOH)))
+	mux.HandleFunc("POST /moh", s.withUser(s.self(s.uploadMOH)))
+	mux.HandleFunc("POST /moh/{id}/delete", s.withUser(s.self(s.deleteMOH)))
+	// 試聴は本人だけ（サポート中の管理者にも聞かせない）
+	mux.HandleFunc("GET /moh/{id}/audio", s.withUser(s.mohAudio))
 	mux.HandleFunc("POST /support-passcode", s.withUser(s.createPasscode))
 	mux.HandleFunc("POST /support-passcode/delete", s.withUser(s.deletePasscode))
 
@@ -140,6 +149,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /support/pbx", s.withUser(s.adminOnly(s.support(s.savePBX))))
 	mux.HandleFunc("POST /support/phones", s.withUser(s.adminOnly(s.support(s.addPhone))))
 	mux.HandleFunc("POST /support/phones/{number}/sip", s.withUser(s.adminOnly(s.support(s.updateSIP))))
+	mux.HandleFunc("POST /support/phones/{number}/moh", s.withUser(s.adminOnly(s.support(s.assignMOH))))
+	mux.HandleFunc("POST /support/moh", s.withUser(s.adminOnly(s.support(s.uploadMOH))))
+	mux.HandleFunc("POST /support/moh/{id}/delete", s.withUser(s.adminOnly(s.support(s.deleteMOH))))
 	mux.HandleFunc("POST /support/phones/{number}/code", s.withUser(s.adminOnly(s.support(s.issueCode))))
 	mux.HandleFunc("POST /support/phones/{number}/rename", s.withUser(s.adminOnly(s.support(s.renamePhone))))
 	mux.HandleFunc("POST /support/phones/{number}/delete", s.withUser(s.adminOnly(s.support(s.deletePhone))))
@@ -157,7 +169,11 @@ func securityHeaders(next http.Handler) http.Handler {
 		if !strings.HasPrefix(r.URL.Path, "/static/") {
 			h.Set("Cache-Control", "no-store")
 		}
-		r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+		limit := int64(64 << 10)
+		if r.Method == http.MethodPost && (r.URL.Path == "/moh" || r.URL.Path == "/support/moh") {
+			limit = maxUploadBytes + 1<<20 // 保留音のファイルとフォームの項目
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, limit)
 		next.ServeHTTP(w, r)
 	})
 }
@@ -199,6 +215,9 @@ var notices = map[string]string{
 	"added":           "iPhone を追加しました。「登録コードを発行」から、アプリに入力するコードを表示できます。",
 	"pbx_saved":       "PBX の設定を保存しました。",
 	"sip_saved":       "内線の設定を保存しました。",
+	"moh_added":       "保留音を追加しました。iPhone の「設定の変更・削除」から、内線に割り当ててください。",
+	"moh_deleted":     "保留音を削除しました。割り当てていた iPhone は標準の保留音に戻ります。",
+	"moh_saved":       "保留音を変更しました。次の保留から使われます。",
 	"deleted":         "iPhone を削除しました。その iPhone のアプリは使えなくなります。",
 	"renamed":         "名前を変更しました。",
 	"passcode_delete": "サポート用パスコードを取り消しました。",
@@ -419,6 +438,9 @@ type phoneView struct {
 	EnrolledAt   time.Time
 	// PBXState は中継用 Asterisk から PBX に届いているか（"online" / "offline" / 不明なら空）
 	PBXState string
+	// MOHFileID / MOHName は割り当てた保留音（空なら標準）
+	MOHFileID string
+	MOHName   string
 }
 
 type auditView struct {
@@ -437,6 +459,11 @@ type dashboardData struct {
 	PBXPort  int
 	Passcode *store.SupportPasscode
 	Audit    []auditView
+	// MOH は利用者の保留音（中継モードのときだけ使える）
+	MOHEnabled bool
+	MOH        []mohView
+	MOHMax     int
+	MOHMaxMin  int
 	// Base は操作の送り先（本人は ""、管理者のサポート中は "/support"）
 	Base string
 }
@@ -454,6 +481,9 @@ var actionLabels = map[string]string{
 	"pbx_changed":      "PBX の設定を変更",
 	"sip_changed":      "内線の設定を変更",
 	"phone_released":   "管理者が iPhone を削除",
+	"moh_added":        "保留音を追加",
+	"moh_deleted":      "保留音を削除",
+	"moh_assigned":     "保留音を変更",
 }
 
 // displayNumber は画面に出す内線番号（利用者の PBX での番号。なければサーバー内の識別子）。
@@ -465,7 +495,7 @@ func displayNumber(e store.Extension) string {
 }
 
 func (s *Server) phoneViewOf(ctx context.Context, e store.Extension) phoneView {
-	v := phoneView{Number: e.Number, PBXExtension: displayNumber(e), SIPUser: e.SIPUsername, AuthUser: e.SIPAuthUsername, Label: e.Label}
+	v := phoneView{Number: e.Number, PBXExtension: displayNumber(e), SIPUser: e.SIPUsername, AuthUser: e.SIPAuthUsername, Label: e.Label, MOHFileID: e.MOHFileID}
 	if d, err := s.store.ActiveDeviceForExtension(ctx, e.Number); err == nil {
 		v.Enrolled, v.DeviceName, v.AppVersion = true, d.Name, d.AppVersion
 		v.Enabled, v.PushReady, v.EnrolledAt = d.Enabled, d.VoIPToken != "", d.CreatedAt
@@ -490,6 +520,28 @@ func (s *Server) dashboardFor(ctx context.Context, subject store.User, base stri
 		data.Phones = append(data.Phones, s.phoneViewOf(ctx, e))
 	}
 	data.CanAdd = len(exts) < data.Max
+	if s.cfg.Relay {
+		data.MOHEnabled, data.MOHMax = true, s.cfg.Web.MOHMaxFiles
+		data.MOHMaxMin = int(s.cfg.Web.MOHMaxDuration / time.Minute)
+		files, err := s.store.ListMOHByOwner(ctx, subject.ID)
+		if err != nil {
+			return dashboardData{}, err
+		}
+		names := map[string]string{}
+		for _, f := range files {
+			names[f.ID] = f.Name
+			v := mohView{ID: f.ID, Name: f.Name, Duration: formatDuration(f.DurationMS)}
+			for _, e := range exts {
+				if e.MOHFileID == f.ID {
+					v.UsedBy = append(v.UsedBy, e.Label)
+				}
+			}
+			data.MOH = append(data.MOH, v)
+		}
+		for i := range data.Phones {
+			data.Phones[i].MOHName = names[data.Phones[i].MOHFileID]
+		}
+	}
 	if p, err := s.store.GetSupportPasscode(ctx, subject.ID); err == nil && time.Now().Before(p.ExpiresAt) {
 		data.Passcode = &p
 	}
@@ -576,6 +628,24 @@ func backTo(base, notice string, ok bool) string {
 		notice = "sync_failed"
 	}
 	return base + "?m=" + notice
+}
+
+// cleanName は利用者が付けた名前を整える（空白をまとめ、40文字まで。空なら def）。
+func cleanName(raw, def string) string {
+	name := strings.TrimSpace(strings.Join(strings.Fields(raw), " "))
+	name = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, name)
+	if r := []rune(name); len(r) > 40 {
+		name = string(r[:40])
+	}
+	if name == "" {
+		name = def
+	}
+	return name
 }
 
 func cleanLabel(raw string) string {
@@ -865,6 +935,148 @@ func (s *Server) deletePhone(w http.ResponseWriter, r *http.Request, rc *reqCtx,
 	s.log.Info("web: phone deleted", "user_id", subject.ID, "line", e.Number, "actor", rc.user.ID)
 	s.audit(ctx, subject.ID, rc.user.ID, "phone_deleted", fmt.Sprintf("%s（内線 %s）", e.Label, displayNumber(e)))
 	http.Redirect(w, r, backTo(base, "deleted", synced), http.StatusSeeOther)
+}
+
+// --- 保留音
+
+// maxUploadBytes は保留音のファイルの大きさの上限（変換前）。
+const maxUploadBytes = 20 << 20
+
+type mohView struct {
+	ID       string
+	Name     string
+	Duration string
+	// UsedBy はこの保留音を割り当てた iPhone の名前
+	UsedBy []string
+}
+
+func formatDuration(ms int) string {
+	sec := (ms + 500) / 1000
+	return fmt.Sprintf("%d:%02d", sec/60, sec%60)
+}
+
+// ownedMOH は subject の保留音だけを返す（他人の保留音は存在しないものとして扱う）。
+func (s *Server) ownedMOH(ctx context.Context, subject store.User, id string) (store.MOHFile, bool) {
+	f, err := s.store.GetMOH(ctx, id)
+	if err != nil || f.OwnerUserID != subject.ID {
+		return store.MOHFile{}, false
+	}
+	return f, true
+}
+
+func (s *Server) uploadMOH(w http.ResponseWriter, r *http.Request, rc *reqCtx, subject store.User, base string) {
+	ctx := r.Context()
+	if !s.cfg.Relay {
+		http.NotFound(w, r)
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		s.message(w, http.StatusBadRequest, rc, "追加できません", "保留音のファイル（WAV または MP3、20MB まで）を選んでください。")
+		return
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxUploadBytes+1))
+	if err != nil || len(data) > maxUploadBytes {
+		s.message(w, http.StatusBadRequest, rc, "追加できません", "ファイルが大きすぎます。20MB までのファイルを選んでください。")
+		return
+	}
+	converted, duration, err := audio.Convert(data, s.cfg.Web.MOHMaxDuration)
+	switch {
+	case errors.Is(err, audio.ErrTooLong):
+		s.message(w, http.StatusBadRequest, rc, "追加できません", fmt.Sprintf("保留音は %d 分までの長さにしてください。", int(s.cfg.Web.MOHMaxDuration/time.Minute)))
+		return
+	case errors.Is(err, audio.ErrTooShort):
+		s.message(w, http.StatusBadRequest, rc, "追加できません", "1秒以上の音声を選んでください。")
+		return
+	case err != nil:
+		s.message(w, http.StatusBadRequest, rc, "追加できません", "このファイルは読み込めません。WAV または MP3 のファイルを選んでください（M4A・AAC などは WAV か MP3 に変換してください）。")
+		return
+	}
+	name := strings.TrimSpace(r.PostFormValue("name"))
+	if name == "" {
+		name = strings.TrimSuffix(header.Filename, filepath.Ext(header.Filename))
+	}
+	name = cleanName(name, "保留音")
+	f := store.MOHFile{ID: secret.NewID(), OwnerUserID: subject.ID, Name: name, DurationMS: int(duration / time.Millisecond), Data: converted}
+	if err := s.store.CreateMOH(ctx, f, s.cfg.Web.MOHMaxFiles); err != nil {
+		if errors.Is(err, store.ErrLimit) {
+			s.message(w, http.StatusConflict, rc, "追加できません", fmt.Sprintf("保留音は %d 個まで登録できます。使わない保留音を削除してから追加してください。", s.cfg.Web.MOHMaxFiles))
+			return
+		}
+		s.log.Error("web: create moh", "error", err)
+		s.message(w, http.StatusInternalServerError, rc, "エラー", "保留音を追加できませんでした。")
+		return
+	}
+	// 利用者が付けた名前・元のファイル名はログに出さない
+	s.log.Info("web: moh added", "user_id", subject.ID, "moh_id", f.ID, "duration_ms", f.DurationMS, "bytes", len(converted), "actor", rc.user.ID)
+	s.audit(ctx, subject.ID, rc.user.ID, "moh_added", name)
+	http.Redirect(w, r, backTo(base, "moh_added", true), http.StatusSeeOther)
+}
+
+func (s *Server) deleteMOH(w http.ResponseWriter, r *http.Request, rc *reqCtx, subject store.User, base string) {
+	ctx := r.Context()
+	f, ok := s.ownedMOH(ctx, subject, r.PathValue("id"))
+	if !ok {
+		s.message(w, http.StatusNotFound, rc, "見つかりません", "この保留音は見つかりません。")
+		return
+	}
+	if err := s.store.DeleteMOH(ctx, f.ID); err != nil {
+		s.message(w, http.StatusInternalServerError, rc, "エラー", "保留音を削除できませんでした。")
+		return
+	}
+	s.log.Info("web: moh deleted", "user_id", subject.ID, "moh_id", f.ID, "actor", rc.user.ID)
+	s.audit(ctx, subject.ID, rc.user.ID, "moh_deleted", f.Name)
+	ok = s.applyRelay(ctx)
+	http.Redirect(w, r, backTo(base, "moh_deleted", ok), http.StatusSeeOther)
+}
+
+// assignMOH は iPhone（内線）に保留音を割り当てる。内線と保留音の両方が subject のものでなければ割り当てない。
+func (s *Server) assignMOH(w http.ResponseWriter, r *http.Request, rc *reqCtx, subject store.User, base string) {
+	ctx := r.Context()
+	e, ok := s.ownedExtension(ctx, subject, r.PathValue("number"))
+	if !ok {
+		s.message(w, http.StatusNotFound, rc, "見つかりません", "この iPhone は見つかりません。")
+		return
+	}
+	id := r.PostFormValue("moh_id")
+	name := "標準の保留音"
+	if id != "" {
+		f, ok := s.ownedMOH(ctx, subject, id)
+		if !ok {
+			s.message(w, http.StatusNotFound, rc, "見つかりません", "この保留音は見つかりません。")
+			return
+		}
+		name = f.Name
+	}
+	if err := s.store.SetExtensionMOH(ctx, e.Number, id); err != nil {
+		s.message(w, http.StatusNotFound, rc, "見つかりません", "この保留音は割り当てられません。")
+		return
+	}
+	s.log.Info("web: moh assigned", "user_id", subject.ID, "line", e.Number, "moh_id", id, "actor", rc.user.ID)
+	s.audit(ctx, subject.ID, rc.user.ID, "moh_assigned", fmt.Sprintf("%s（内線 %s）→ %s", e.Label, displayNumber(e), name))
+	ok = s.applyRelay(ctx)
+	http.Redirect(w, r, backTo(base, "moh_saved", ok), http.StatusSeeOther)
+}
+
+// mohAudio は保留音を試聴用に返す。持ち主本人だけが聞ける（サポート中の管理者も対象外）。
+func (s *Server) mohAudio(w http.ResponseWriter, r *http.Request, rc *reqCtx) {
+	ctx := r.Context()
+	f, ok := s.ownedMOH(ctx, rc.user, r.PathValue("id"))
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	data, err := s.store.GetMOHData(ctx, f.ID)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "audio/wav")
+	w.Header().Set("Content-Disposition", "inline")
+	w.Header().Set("Cache-Control", "private, no-store")
+	// Safari の audio 要素は範囲指定の取得（206）を使うため ServeContent で返す
+	http.ServeContent(w, r, "", f.CreatedAt, bytes.NewReader(data))
 }
 
 // --- サポート用パスコード

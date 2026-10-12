@@ -78,6 +78,9 @@ type WebConfig struct {
 	// AllowedPBX は利用者が設定できる PBX のアドレス帯（MYVOIP_ALLOWED_PBX_CIDRS。既定は Tailnet）。
 	// 利用者が入力したアドレスにこのサーバーから SIP を送るため、意図しない宛先（LAN 内の機器など）を防ぐ
 	AllowedPBX []netip.Prefix
+	// MOHMaxFiles は利用者1人が登録できる保留音の数、MOHMaxDuration は1つの保留音の長さの上限
+	MOHMaxFiles    int
+	MOHMaxDuration time.Duration
 	// MaxPhonesPerUser は利用者1人が作成できる iPhone（内線）の上限
 	MaxPhonesPerUser int
 	SessionTTL       time.Duration
@@ -159,6 +162,8 @@ func Load(requireRuntime bool) (Config, error) {
 		AllowedUserIDs:      list(env("DISCORD_ALLOWED_USER_IDS", "")),
 		AdminIDs:            list(env("MYVOIP_ADMIN_DISCORD_IDS", "")),
 		MaxPhonesPerUser:    envInt("MYVOIP_MAX_PHONES_PER_USER", 3),
+		MOHMaxFiles:         envInt("MYVOIP_MOH_MAX_FILES_PER_USER", 5),
+		MOHMaxDuration:      time.Duration(envInt("MYVOIP_MOH_MAX_SECONDS", 300)) * time.Second,
 		SessionTTL:          time.Duration(envInt("WEB_SESSION_HOURS", 168)) * time.Hour,
 		SupportCodeTTL:      time.Duration(envInt("SUPPORT_PASSCODE_MINUTES", 30)) * time.Minute,
 		SupportSessionTTL:   time.Duration(envInt("SUPPORT_SESSION_MINUTES", 60)) * time.Minute,
@@ -235,6 +240,12 @@ func Load(requireRuntime bool) (Config, error) {
 		}
 		if c.Web.MaxPhonesPerUser < 1 || c.Web.MaxPhonesPerUser > 20 {
 			errs = append(errs, "MYVOIP_MAX_PHONES_PER_USER must be between 1 and 20")
+		}
+		if c.Web.MOHMaxFiles < 0 || c.Web.MOHMaxFiles > 50 {
+			errs = append(errs, "MYVOIP_MOH_MAX_FILES_PER_USER must be between 0 and 50")
+		}
+		if c.Web.MOHMaxDuration < 10*time.Second || c.Web.MOHMaxDuration > 20*time.Minute {
+			errs = append(errs, "MYVOIP_MOH_MAX_SECONDS must be between 10 and 1200")
 		}
 		if c.Web.DiscordGuildID == "" && len(c.Web.DiscordRoleIDs) > 0 {
 			errs = append(errs, "DISCORD_ROLE_IDS requires DISCORD_GUILD_ID")

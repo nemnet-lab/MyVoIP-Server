@@ -22,6 +22,7 @@ type Memory struct {
 	sessions  map[string]WebSession
 	passcodes map[string]SupportPasscode
 	audit     []AuditEntry
+	moh       map[string]MOHFile
 }
 
 func NewMemory() *Memory {
@@ -35,6 +36,7 @@ func NewMemory() *Memory {
 		users:      map[string]User{},
 		sessions:   map[string]WebSession{},
 		passcodes:  map[string]SupportPasscode{},
+		moh:        map[string]MOHFile{},
 	}
 }
 
@@ -47,9 +49,9 @@ func (m *Memory) UpsertExtension(_ context.Context, e Extension) error {
 			e.MobilePasswordEnc = old.MobilePasswordEnc
 		}
 		// 割り当ては UpsertExtension では変えない（PostgreSQL 実装と同じ）
-		e.OwnerUserID, e.PBXExtension, e.Label, e.AssignedAt = old.OwnerUserID, old.PBXExtension, old.Label, old.AssignedAt
+		e.OwnerUserID, e.PBXExtension, e.Label, e.AssignedAt, e.MOHFileID = old.OwnerUserID, old.PBXExtension, old.Label, old.AssignedAt, old.MOHFileID
 	} else {
-		e.OwnerUserID, e.PBXExtension, e.Label, e.AssignedAt = "", "", "", nil
+		e.OwnerUserID, e.PBXExtension, e.Label, e.AssignedAt, e.MOHFileID = "", "", "", nil, ""
 	}
 	m.extensions[e.Number] = e
 	return nil
@@ -537,7 +539,7 @@ func (m *Memory) AssignExtension(_ context.Context, number, userID, label string
 	if !ok || e.OwnerUserID != "" {
 		return ErrNotFound
 	}
-	e.OwnerUserID, e.Label, e.AssignedAt = userID, label, &now
+	e.OwnerUserID, e.Label, e.AssignedAt, e.MOHFileID = userID, label, &now, ""
 	m.extensions[number] = e
 	return nil
 }
@@ -549,7 +551,7 @@ func (m *Memory) ReleaseExtension(_ context.Context, number string, now time.Tim
 	if !ok {
 		return ErrNotFound
 	}
-	e.OwnerUserID, e.Label, e.AssignedAt = "", "", nil
+	e.OwnerUserID, e.Label, e.AssignedAt, e.MOHFileID = "", "", nil, ""
 	m.extensions[number] = e
 	for id, d := range m.devices {
 		if d.Extension == number && d.RevokedAt == nil {
@@ -652,4 +654,109 @@ func (m *Memory) ListAudit(_ context.Context, userID string, limit int) ([]Audit
 		}
 	}
 	return list, nil
+}
+
+func (m *Memory) CreateMOH(_ context.Context, f MOHFile, max int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.users[f.OwnerUserID]; !ok {
+		return ErrNotFound
+	}
+	count := 0
+	for _, x := range m.moh {
+		if x.OwnerUserID == f.OwnerUserID {
+			count++
+		}
+	}
+	if count >= max {
+		return ErrLimit
+	}
+	f.SizeBytes, f.CreatedAt = len(f.Data), time.Now()
+	f.Data = append([]byte(nil), f.Data...)
+	m.moh[f.ID] = f
+	return nil
+}
+
+func (m *Memory) GetMOH(_ context.Context, id string) (MOHFile, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	f, ok := m.moh[id]
+	if !ok {
+		return MOHFile{}, ErrNotFound
+	}
+	f.Data = nil
+	return f, nil
+}
+
+func (m *Memory) GetMOHData(_ context.Context, id string) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	f, ok := m.moh[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return append([]byte(nil), f.Data...), nil
+}
+
+func (m *Memory) listMOH(match func(MOHFile) bool) []MOHFile {
+	var list []MOHFile
+	for _, f := range m.moh {
+		if match(f) {
+			f.Data = nil
+			list = append(list, f)
+		}
+	}
+	sort.Slice(list, func(i, j int) bool {
+		if !list[i].CreatedAt.Equal(list[j].CreatedAt) {
+			return list[i].CreatedAt.Before(list[j].CreatedAt)
+		}
+		return list[i].ID < list[j].ID
+	})
+	return list
+}
+
+func (m *Memory) ListMOHByOwner(_ context.Context, userID string) ([]MOHFile, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.listMOH(func(f MOHFile) bool { return f.OwnerUserID == userID }), nil
+}
+
+func (m *Memory) ListAllMOH(_ context.Context) ([]MOHFile, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.listMOH(func(MOHFile) bool { return true }), nil
+}
+
+func (m *Memory) DeleteMOH(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.moh[id]; !ok {
+		return ErrNotFound
+	}
+	delete(m.moh, id)
+	for n, e := range m.extensions {
+		if e.MOHFileID == id {
+			e.MOHFileID = ""
+			m.extensions[n] = e
+		}
+	}
+	return nil
+}
+
+func (m *Memory) SetExtensionMOH(_ context.Context, number, mohID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e, ok := m.extensions[number]
+	if !ok {
+		return ErrNotFound
+	}
+	if mohID != "" {
+		f, ok := m.moh[mohID]
+		if !ok || e.OwnerUserID == "" || f.OwnerUserID != e.OwnerUserID {
+			return ErrNotFound
+		}
+	}
+	e.MOHFileID = mohID
+	m.extensions[number] = e
+	return nil
 }

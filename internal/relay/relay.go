@@ -32,6 +32,18 @@ const mobileRTPTimeout = 60
 // FileName は pjsip.conf から #tryinclude される生成ファイル。
 const FileName = "pjsip_myvoip.conf"
 
+// MOHFileName は musiconhold.conf から #tryinclude される生成ファイル（利用者の保留音のクラス）。
+const MOHFileName = "musiconhold_myvoip.conf"
+
+// DefaultAsteriskDir は中継用 Asterisk から見た共有ディレクトリ（docker-compose.yml のボリューム）。
+const DefaultAsteriskDir = "/etc/asterisk/myvoip"
+
+// MOHClass は保留音の Asterisk のクラス名。
+func MOHClass(id string) string { return "myvoip-moh-" + id }
+
+// safeMOHID はファイル名・設定に使ってよい保留音の ID（サーバーが作る UUID）。
+var safeMOHID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
 type Options struct {
 	// UpstreamHost / Port は既定の PBX（持ち主のいない内線と、PBX を設定していない利用者の内線の登録先）
 	UpstreamHost string
@@ -42,6 +54,10 @@ type Options struct {
 	AllowedClients []netip.Prefix
 	// SRTP は optional / mandatory / disabled（mandatory のときだけ iPhone 側を sdes にする）
 	SRTP string
+	// MOH は書き出した保留音の ID（ここにある保留音だけを内線に割り当てる）
+	MOH map[string]bool
+	// AsteriskDir は中継用 Asterisk から見た共有ディレクトリ（空なら DefaultAsteriskDir）
+	AsteriskDir string
 }
 
 // Upstream は中継用 Asterisk が登録する PBX の SIP の接続先。
@@ -184,6 +200,11 @@ func renderExtension(out *strings.Builder, e store.Extension, box *secret.Box, o
 		"auth=%s\naors=%s\ndirect_media=no\nrtp_symmetric=yes\nforce_rport=yes\nrewrite_contact=yes\n"+
 		"dtmf_mode=rfc4733\nmedia_encryption=%s\nrtp_timeout=%d\nset_var=MYVOIP_EXT=%s\n",
 		e.Number, e.Number, e.Number, encryption, mobileRTPTimeout, e.Number)
+	// iPhone が保留したとき、相手（PBX 側）に流す保留音。iPhone 用のエンドポイントにだけ付ける
+	//（保留した側のエンドポイントの moh_suggest が、相手のチャネルの保留音のクラスになる）
+	if e.MOHFileID != "" && opts.MOH[e.MOHFileID] {
+		fmt.Fprintf(&b, "moh_suggest=%s\n", MOHClass(e.MOHFileID))
+	}
 	if len(opts.AllowedClients) > 0 {
 		b.WriteString("deny=0.0.0.0/0.0.0.0\ndeny=::/0\n")
 		for _, p := range opts.AllowedClients {
@@ -210,16 +231,18 @@ func safeValue(s string) bool {
 }
 
 // Write は設定ファイルを置き換える（途中の状態を Asterisk に読ませない）。
-func Write(dir, content string) error {
+func Write(dir, content string) error { return writeFile(dir, FileName, []byte(content)) }
+
+func writeFile(dir, name string, content []byte) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".pjsip_myvoip-*.conf")
+	tmp, err := os.CreateTemp(dir, ".myvoip-*.tmp")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(tmp.Name())
-	if _, err := tmp.WriteString(content); err != nil {
+	if _, err := tmp.Write(content); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -230,7 +253,7 @@ func Write(dir, content string) error {
 	if err := os.Chmod(tmp.Name(), 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), filepath.Join(dir, FileName))
+	return os.Rename(tmp.Name(), filepath.Join(dir, name))
 }
 
 // Reloader は Asterisk のモジュールを再読み込みする（ARI）。
@@ -263,19 +286,80 @@ func Sync(ctx context.Context, st store.Store, box *secret.Box, opts Options, di
 			opts.UserPBX[u.ID] = Upstream{Host: u.PBXHost, Port: u.PBXPort}
 		}
 	}
+	result := Result{}
+	// 保留音は、音声を先に書いてからクラスを定義する（クラスのディレクトリが空のまま読ませない）
+	opts.MOH, result.Skipped, err = syncMOH(ctx, st, opts, dir)
+	if err != nil {
+		return result, err
+	}
 	content, skipped := Render(exts, box, opts)
-	result := Result{Skipped: skipped}
+	result.Skipped = append(result.Skipped, skipped...)
 	if err := Write(dir, content); err != nil {
 		return result, err
 	}
-	if reloader == nil {
-		return result, nil
+	if reloader != nil {
+		for _, module := range []string{"res_musiconhold.so", "res_pjsip.so", "res_pjsip_outbound_registration.so"} {
+			if err := reloader.ReloadModule(ctx, module); err != nil {
+				return result, fmt.Errorf("reload %s: %w", module, err)
+			}
+		}
 	}
-	if err := reloader.ReloadModule(ctx, "res_pjsip.so"); err != nil {
-		return result, fmt.Errorf("reload res_pjsip: %w", err)
-	}
-	if err := reloader.ReloadModule(ctx, "res_pjsip_outbound_registration.so"); err != nil {
-		return result, fmt.Errorf("reload res_pjsip_outbound_registration: %w", err)
-	}
+	// 消した保留音の音声は、新しい設定を読ませてから消す
+	removeStaleMOH(dir, opts.MOH)
 	return result, nil
+}
+
+// syncMOH は保留音の音声を共有ディレクトリに書き出し（まだないものだけ）、クラスの設定を書く。
+// 音声は利用者ごとではなく保留音ごとのディレクトリに置き、クラス名・パスには利用者が付けた名前を使わない。
+func syncMOH(ctx context.Context, st store.Store, opts Options, dir string) (map[string]bool, []string, error) {
+	files, err := st.ListAllMOH(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	asteriskDir := opts.AsteriskDir
+	if asteriskDir == "" {
+		asteriskDir = DefaultAsteriskDir
+	}
+	available := map[string]bool{}
+	var skipped []string
+	var conf strings.Builder
+	conf.WriteString("; MyVoIP-Server が生成する設定です。手で編集しないでください（利用者の保留音）。\n")
+	for _, f := range files {
+		if !safeMOHID.MatchString(f.ID) {
+			skipped = append(skipped, fmt.Sprintf("moh %q: invalid id", f.ID))
+			continue
+		}
+		mohDir := filepath.Join(dir, "moh", f.ID)
+		if _, err := os.Stat(filepath.Join(mohDir, "hold.wav")); err != nil {
+			data, err := st.GetMOHData(ctx, f.ID)
+			if err != nil {
+				skipped = append(skipped, fmt.Sprintf("moh %s: %v", f.ID, err))
+				continue
+			}
+			if err := os.MkdirAll(mohDir, 0o755); err != nil {
+				return nil, nil, err
+			}
+			if err := writeFile(mohDir, "hold.wav", data); err != nil {
+				return nil, nil, err
+			}
+		}
+		available[f.ID] = true
+		fmt.Fprintf(&conf, "\n[%s]\nmode=files\ndirectory=%s/moh/%s\nsort=alpha\n", MOHClass(f.ID), asteriskDir, f.ID)
+	}
+	if err := writeFile(dir, MOHFileName, []byte(conf.String())); err != nil {
+		return nil, nil, err
+	}
+	return available, skipped, nil
+}
+
+func removeStaleMOH(dir string, keep map[string]bool) {
+	entries, err := os.ReadDir(filepath.Join(dir, "moh"))
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() && safeMOHID.MatchString(e.Name()) && !keep[e.Name()] {
+			_ = os.RemoveAll(filepath.Join(dir, "moh", e.Name()))
+		}
+	}
 }

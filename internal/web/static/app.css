@@ -155,3 +155,6 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 code.big { font-size: 1.6rem; letter-spacing: 0.08em; }
 .qr img { background: #ffffff; padding: 8px; border-radius: 8px; max-width: 100%; height: auto; }
 .passcode { margin: 16px 0; }
+
+audio { max-width: 100%; height: 36px; }
+input[type="file"] { padding: 6px; }

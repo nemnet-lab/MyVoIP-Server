@@ -1,5 +1,5 @@
 {{define "content"}}
-{{$csrf := .CSRF}}{{$base := .Data.Base}}
+{{$csrf := .CSRF}}{{$base := .Data.Base}}{{$data := .Data}}
 <section class="card">
   <h2>PBX の設定</h2>
   <p>あなたの MikoPBX・Asterisk の SIP の接続先です。このサーバーは、ここに iPhone ごとの内線として登録します。</p>
@@ -31,6 +31,7 @@
         <span class="muted">内線 {{.PBXExtension}}</span>
         {{if eq .PBXState "online"}}<span class="tag ok">PBX に接続中</span>{{else if eq .PBXState "offline"}}<span class="tag warn">PBX に届きません</span>{{end}}
       </div>
+      {{if $data.MOHEnabled}}<p class="muted">保留音：{{if .MOHName}}{{.MOHName}}{{else}}標準{{end}}</p>{{end}}
       {{if .Enrolled}}
       <p class="status ok">登録済み：{{.DeviceName}}{{if .AppVersion}}（アプリ {{.AppVersion}}）{{end}}・{{datetime .EnrolledAt}}</p>
       {{if not .PushReady}}<p class="status warn">着信の準備ができていません。アプリを一度開いてください。</p>{{end}}
@@ -50,6 +51,17 @@
             <input name="label" value="{{.Label}}" maxlength="40" aria-label="名前">
             <button>名前を変更</button>
           </form>
+          {{if $data.MOHEnabled}}
+          {{$current := .MOHFileID}}
+          <form method="post" action="{{$base}}/phones/{{.Number}}/moh" class="row">
+            <input type="hidden" name="csrf" value="{{$csrf}}">
+            <select name="moh_id" aria-label="保留音">
+              <option value="">標準の保留音</option>
+              {{range $data.MOH}}<option value="{{.ID}}"{{if eq .ID $current}} selected{{end}}>{{.Name}}</option>{{end}}
+            </select>
+            <button>保留音を変更</button>
+          </form>
+          {{end}}
           <form method="post" action="{{$base}}/phones/{{.Number}}/sip" class="grid">
             <input type="hidden" name="csrf" value="{{$csrf}}">
             <label>内線番号<input name="pbx_extension" value="{{.PBXExtension}}" required maxlength="40" autocomplete="off"></label>
@@ -96,6 +108,46 @@
   <p class="muted">iPhone は {{.Data.Max}} 台まで作成できます。</p>
   {{end}}
 </section>
+
+{{if .Data.MOHEnabled}}
+<section class="card">
+  <h2>保留音</h2>
+  <p>iPhone で保留したときに、相手に流れる音です。登録した保留音を聞けるのはあなただけです（ほかの利用者からは見えず、サポート中の管理者も試聴できません）。</p>
+  {{if .Data.MOH}}
+  <ul class="phones">
+    {{range .Data.MOH}}
+    <li class="phone">
+      <div class="phone-head"><strong>{{.Name}}</strong><span class="muted">{{.Duration}}</span></div>
+      <p class="muted">{{if .UsedBy}}使っている iPhone：{{range $i, $n := .UsedBy}}{{if $i}}、{{end}}{{$n}}{{end}}{{else}}どの iPhone にも割り当てていません{{end}}</p>
+      <div class="actions">
+        {{if eq $base ""}}<audio controls preload="none" src="/moh/{{.ID}}/audio"></audio>{{end}}
+        <form method="post" action="{{$base}}/moh/{{.ID}}/delete" class="inline" data-confirm="保留音「{{.Name}}」を削除します。割り当てていた iPhone は標準の保留音に戻ります。よろしいですか？">
+          <input type="hidden" name="csrf" value="{{$csrf}}">
+          <button class="small danger">削除</button>
+        </form>
+      </div>
+    </li>
+    {{end}}
+  </ul>
+  {{else}}
+  <p class="muted">まだ登録していません。保留したときは標準の保留音が流れます。</p>
+  {{end}}
+  {{if lt (len .Data.MOH) .Data.MOHMax}}
+  <details {{if not .Data.MOH}}open{{end}}>
+    <summary>保留音を追加</summary>
+    <form method="post" action="{{$base}}/moh" enctype="multipart/form-data" class="grid">
+      <input type="hidden" name="csrf" value="{{$csrf}}">
+      <label>名前（省略時はファイル名）<input name="name" maxlength="40"></label>
+      <label>ファイル（WAV・MP3）<input type="file" name="file" accept=".wav,.mp3,audio/wav,audio/x-wav,audio/mpeg" required></label>
+      <button class="primary">追加</button>
+    </form>
+    <p class="muted">20MB・{{.Data.MOHMaxMin}}分まで、{{.Data.MOHMax}}個まで登録できます。電話の音質（8kHz・モノラル）に変換し、音量をそろえて保存します。著作権のある音楽は、使ってよいものだけを登録してください。</p>
+  </details>
+  {{else if .Data.MOHMax}}
+  <p class="muted">保留音は {{.Data.MOHMax}} 個まで登録できます。</p>
+  {{end}}
+</section>
+{{end}}
 
 {{if eq $base ""}}
 <section class="card">

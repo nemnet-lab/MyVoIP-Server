@@ -1,9 +1,13 @@
 package relay
 
 import (
+	"context"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nemnet-lab/MyVoIP-Server/internal/secret"
 	"github.com/nemnet-lab/MyVoIP-Server/internal/store"
@@ -95,5 +99,86 @@ func TestRenderRegistersEachUsersPBX(t *testing.T) {
 	// 既定の PBX もなければ、利用者の PBX がない内線は書かない
 	if _, skipped := Render(exts[2:3], box, Options{}); len(skipped) != 1 {
 		t.Fatalf("extension without PBX must be skipped: %v", skipped)
+	}
+}
+
+type recordingReloader struct{ modules []string }
+
+func (r *recordingReloader) ReloadModule(_ context.Context, name string) error {
+	r.modules = append(r.modules, name)
+	return nil
+}
+
+func TestSyncWritesUsersHoldMusic(t *testing.T) {
+	ctx := context.Background()
+	box, _ := secret.NewBox(secret.NewKey())
+	st := store.NewMemory()
+	dir := t.TempDir()
+	now := time.Now()
+	for _, id := range []string{"u-1", "u-2"} {
+		if _, err := st.UpsertDiscordUser(ctx, store.User{ID: id, DiscordID: "d" + id}, now); err != nil {
+			t.Fatal(err)
+		}
+		_ = st.SetUserPBX(ctx, id, "100.64.0.21", 5060)
+	}
+	for _, e := range []store.Extension{
+		{Number: "mv1", SIPUsername: "201", SIPPasswordEnc: box.Seal("a"), MobilePasswordEnc: box.Seal("m"), OwnerUserID: "u-1", PBXExtension: "201"},
+		{Number: "mv2", SIPUsername: "202", SIPPasswordEnc: box.Seal("b"), MobilePasswordEnc: box.Seal("m"), OwnerUserID: "u-2", PBXExtension: "202"},
+	} {
+		if err := st.CreateOwnedExtension(ctx, e, 5, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const mohID = "0f8fad5b-d9cb-469f-a165-70867728950e"
+	if err := st.CreateMOH(ctx, store.MOHFile{ID: mohID, OwnerUserID: "u-1", Name: "曲", DurationMS: 1000, Data: []byte("RIFF-wav-data")}, 5); err != nil {
+		t.Fatal(err)
+	}
+	// 他人の保留音は割り当てられない
+	if err := st.SetExtensionMOH(ctx, "mv2", mohID); err == nil {
+		t.Fatal("assigned another user's hold music")
+	}
+	if err := st.SetExtensionMOH(ctx, "mv1", mohID); err != nil {
+		t.Fatal(err)
+	}
+	reloader := &recordingReloader{}
+	result, err := Sync(ctx, st, box, Options{}, dir, reloader)
+	if err != nil || len(result.Skipped) > 0 {
+		t.Fatal(err, result.Skipped)
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "moh", mohID, "hold.wav")); err != nil || string(b) != "RIFF-wav-data" {
+		t.Fatalf("hold music file: %q %v", b, err)
+	}
+	mohConf, _ := os.ReadFile(filepath.Join(dir, MOHFileName))
+	if !strings.Contains(string(mohConf), "[myvoip-moh-"+mohID+"]\nmode=files\ndirectory=/etc/asterisk/myvoip/moh/"+mohID+"\n") {
+		t.Fatalf("musiconhold conf:\n%s", mohConf)
+	}
+	if strings.Contains(string(mohConf), "曲") {
+		t.Fatal("user-supplied name must not appear in the Asterisk configuration")
+	}
+	pjsip, _ := os.ReadFile(filepath.Join(dir, FileName))
+	cfg := string(pjsip)
+	// iPhone 用エンドポイント（mv1）にだけ付く
+	mobile := cfg[strings.Index(cfg, "[mv1]\ntype=endpoint"):]
+	mobile = mobile[:strings.Index(mobile, "\n\n; =====")+1]
+	if !strings.Contains(mobile, "moh_suggest=myvoip-moh-"+mohID) || strings.Count(cfg, "moh_suggest=") != 1 {
+		t.Fatalf("moh_suggest not only on mv1's mobile endpoint:\n%s", cfg)
+	}
+	if strings.Join(reloader.modules, ",") != "res_musiconhold.so,res_pjsip.so,res_pjsip_outbound_registration.so" {
+		t.Fatalf("reloaded %v", reloader.modules)
+	}
+	// 消すと割り当てが外れ、音声とクラスも消える
+	if err := st.DeleteMOH(ctx, mohID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Sync(ctx, st, box, Options{}, dir, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "moh", mohID)); !os.IsNotExist(err) {
+		t.Fatalf("hold music directory remains: %v", err)
+	}
+	pjsip, _ = os.ReadFile(filepath.Join(dir, FileName))
+	mohConf, _ = os.ReadFile(filepath.Join(dir, MOHFileName))
+	if strings.Contains(string(pjsip), "moh_suggest") || strings.Contains(string(mohConf), mohID) {
+		t.Fatal("deleted hold music is still configured")
 	}
 }

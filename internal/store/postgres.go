@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -107,12 +108,12 @@ func (p *Postgres) UpsertExtension(ctx context.Context, e Extension) error {
 }
 
 const extensionColumns = `number, display_name, sip_username, sip_auth_username, sip_password_enc, endpoint, ring_timeout_seconds, updated_at, mobile_password_enc,
-	COALESCE(owner_user_id, ''), pbx_extension, label, assigned_at`
+	COALESCE(owner_user_id, ''), pbx_extension, label, assigned_at, COALESCE(moh_file_id, '')`
 
 func scanExtension(row pgx.Row) (Extension, error) {
 	var e Extension
 	err := row.Scan(&e.Number, &e.DisplayName, &e.SIPUsername, &e.SIPAuthUsername, &e.SIPPasswordEnc, &e.Endpoint, &e.RingTimeoutSeconds, &e.UpdatedAt, &e.MobilePasswordEnc,
-		&e.OwnerUserID, &e.PBXExtension, &e.Label, &e.AssignedAt)
+		&e.OwnerUserID, &e.PBXExtension, &e.Label, &e.AssignedAt, &e.MOHFileID)
 	return e, notFound(err)
 }
 
@@ -567,7 +568,7 @@ func (p *Postgres) DeleteExtension(ctx context.Context, number string) error {
 
 func (p *Postgres) AssignExtension(ctx context.Context, number, userID, label string, now time.Time) error {
 	tag, err := p.pool.Exec(ctx, `
-		UPDATE extensions SET owner_user_id=$2, label=$3, assigned_at=$4, updated_at=now()
+		UPDATE extensions SET owner_user_id=$2, label=$3, assigned_at=$4, moh_file_id=NULL, updated_at=now()
 		WHERE number=$1 AND owner_user_id IS NULL`, number, userID, label, now)
 	if err != nil {
 		return err
@@ -584,7 +585,7 @@ func (p *Postgres) ReleaseExtension(ctx context.Context, number string, now time
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
-	tag, err := tx.Exec(ctx, `UPDATE extensions SET owner_user_id=NULL, label='', assigned_at=NULL, updated_at=now() WHERE number=$1`, number)
+	tag, err := tx.Exec(ctx, `UPDATE extensions SET owner_user_id=NULL, label='', assigned_at=NULL, moh_file_id=NULL, updated_at=now() WHERE number=$1`, number)
 	if err != nil {
 		return err
 	}
@@ -652,6 +653,107 @@ func (p *Postgres) ConsumeSupportPasscode(ctx context.Context, codeHash string, 
 	var userID string
 	err := p.pool.QueryRow(ctx, `DELETE FROM support_passcodes WHERE code_hash=$1 AND expires_at > $2 RETURNING user_id`, codeHash, now).Scan(&userID)
 	return userID, notFound(err)
+}
+
+// --- Web 管理画面：保留音
+
+const mohColumns = `id, owner_user_id, name, duration_ms, size_bytes, created_at`
+
+func scanMOH(row pgx.Row) (MOHFile, error) {
+	var m MOHFile
+	err := row.Scan(&m.ID, &m.OwnerUserID, &m.Name, &m.DurationMS, &m.SizeBytes, &m.CreatedAt)
+	return m, notFound(err)
+}
+
+func (p *Postgres) listMOH(ctx context.Context, query string, args ...any) ([]MOHFile, error) {
+	rows, err := p.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var list []MOHFile
+	for rows.Next() {
+		m, err := scanMOH(rows)
+		if err != nil {
+			return nil, err
+		}
+		list = append(list, m)
+	}
+	return list, rows.Err()
+}
+
+func (p *Postgres) CreateMOH(ctx context.Context, m MOHFile, max int) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	var id string
+	if err := tx.QueryRow(ctx, `SELECT id FROM users WHERE id=$1 FOR UPDATE`, m.OwnerUserID).Scan(&id); err != nil {
+		return notFound(err)
+	}
+	var count int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM moh_files WHERE owner_user_id=$1`, m.OwnerUserID).Scan(&count); err != nil {
+		return err
+	}
+	if count >= max {
+		return ErrLimit
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO moh_files(id, owner_user_id, name, duration_ms, size_bytes, data) VALUES ($1,$2,$3,$4,$5,$6)`,
+		m.ID, m.OwnerUserID, m.Name, m.DurationMS, len(m.Data), m.Data); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) GetMOH(ctx context.Context, id string) (MOHFile, error) {
+	return scanMOH(p.pool.QueryRow(ctx, `SELECT `+mohColumns+` FROM moh_files WHERE id=$1`, id))
+}
+
+func (p *Postgres) GetMOHData(ctx context.Context, id string) ([]byte, error) {
+	var data []byte
+	err := p.pool.QueryRow(ctx, `SELECT data FROM moh_files WHERE id=$1`, id).Scan(&data)
+	return data, notFound(err)
+}
+
+func (p *Postgres) ListMOHByOwner(ctx context.Context, userID string) ([]MOHFile, error) {
+	return p.listMOH(ctx, `SELECT `+mohColumns+` FROM moh_files WHERE owner_user_id=$1 ORDER BY created_at, id`, userID)
+}
+
+func (p *Postgres) ListAllMOH(ctx context.Context) ([]MOHFile, error) {
+	return p.listMOH(ctx, `SELECT `+mohColumns+` FROM moh_files ORDER BY id`)
+}
+
+func (p *Postgres) DeleteMOH(ctx context.Context, id string) error {
+	tag, err := p.pool.Exec(ctx, `DELETE FROM moh_files WHERE id=$1`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (p *Postgres) SetExtensionMOH(ctx context.Context, number, mohID string) error {
+	var tag pgconn.CommandTag
+	var err error
+	if mohID == "" {
+		tag, err = p.pool.Exec(ctx, `UPDATE extensions SET moh_file_id=NULL, updated_at=now() WHERE number=$1`, number)
+	} else {
+		// 内線の持ち主と保留音の持ち主が同じときだけ割り当てる
+		tag, err = p.pool.Exec(ctx, `
+			UPDATE extensions e SET moh_file_id=m.id, updated_at=now()
+			FROM moh_files m
+			WHERE e.number=$1 AND m.id=$2 AND e.owner_user_id IS NOT NULL AND m.owner_user_id=e.owner_user_id`, number, mohID)
+	}
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // --- Web 管理画面：操作記録
