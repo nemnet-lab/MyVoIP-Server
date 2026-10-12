@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MyVoIP プライバシーポリシー</title>
+<style>
+:root { --fg:#1d1d1f; --muted:#6e6e73; --bg:#fff; --line:#d2d2d7; --link:#0066cc; --card:#f5f5f7; }
+@media (prefers-color-scheme: dark) { :root { --fg:#f5f5f7; --muted:#a1a1a6; --bg:#000; --line:#424245; --link:#2997ff; --card:#1d1d1f; } }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.75 -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP", sans-serif; }
+main { max-width:760px; margin:0 auto; padding:32px 16px 64px; }
+h1 { font-size:1.7em; line-height:1.3; margin:0 0 .6em; }
+h2 { font-size:1.2em; margin:2em 0 .6em; padding-bottom:.3em; border-bottom:1px solid var(--line); }
+a { color:var(--link); overflow-wrap:anywhere; }
+.table { overflow-x:auto; }
+table { border-collapse:collapse; width:100%; font-size:.92em; }
+th, td { border:1px solid var(--line); padding:8px 10px; text-align:left; vertical-align:top; }
+th { background:var(--card); }
+code { background:var(--card); padding:0 4px; border-radius:4px; }
+footer { margin-top:48px; color:var(--muted); font-size:.85em; }
+</style>
+</head>
+<body>
+<main>
+<h1>MyVoIP プライバシーポリシー</h1>
+<p>制定日：2026年10月12日<br>運営者：MyVoIP の個人開発者（以下「運営者」）<br>運営者の氏名・住所：ご請求があれば、遅滞なくお知らせします（9. の窓口へご連絡ください）。<br>お問い合わせ・苦情の窓口：<a href="mailto:tkytel-iosapp-support@nemnet-lab.net">tkytel-iosapp-support@nemnet-lab.net</a></p>
+<h2>1. このポリシーの対象</h2>
+<p>このポリシーは、iPhone アプリ「MyVoIP」（以下「本アプリ」）と、本アプリが接続する着信制御サーバー・Web 管理画面（以下「本サービス」）での、利用者の情報の扱いを定めます。</p>
+<p>本アプリは、利用者または利用者の所属組織が用意した PBX（構内交換機）に接続して通話するアプリです。PBX の通話記録（CDR）や録音などの扱いは、その PBX の管理者の方針によります。</p>
+<h2>2. 取得する情報と利用目的</h2>
+<div class="table"><table><thead><tr><th>情報</th><th>取得の場面</th><th>利用目的</th></tr></thead><tbody><tr><td>Discord のユーザー ID・ユーザー名・表示名</td><td>Web 管理画面に Discord でログインしたとき</td><td>本人確認、利用者の管理</td></tr><tr><td>PBX の接続先（アドレス・ポート）、内線番号、SIP の認証情報</td><td>Web 管理画面で PBX と iPhone を登録したとき</td><td>着信の受け付けと、PBX への発信の中継。SIP のパスワードは暗号化して保存します</td></tr><tr><td>端末 ID、端末名、アプリのバージョン、Push 通知のトークン</td><td>アプリを登録したとき・起動したとき</td><td>着信を Push 通知で端末に知らせるため</td></tr><tr><td>着信・発信の相手の電話番号と名前（PBX が通知したもの）、通話の日時・時間・結果</td><td>着信・発信のたび</td><td>アプリ内の通話履歴の表示、不在着信の通知</td></tr><tr><td>テスト着信の録音</td><td>利用者が「テスト着信」を行ったとき</td><td>音声が届くかの確認。テスト着信の終了時に削除します</td></tr><tr><td>操作の記録（iPhone の追加・削除、登録コードの発行、サポートの開始など）</td><td>Web 管理画面の操作のたび</td><td>利用者本人と管理者による確認、不正利用の防止</td></tr></tbody></table></div>
+<p>運営者は、これらの情報を上の目的の範囲を超えて使いません。広告やトラッキングには使いません。</p>
+<p>本サービスは、通話の音声を保存しません（テスト着信の録音を除く）。通話の音声は、PBX との間で中継されるだけです。</p>
+<h2>3. 端末内だけで扱う情報</h2>
+<ul><li><strong>iPhone の連絡先：</strong> 利用者が許可した場合に、発信先の選択と着信時の名前の表示に使います。サーバーには送りません。</li><li><strong>アプリ内の連絡先：</strong> 端末内にだけ保存します。</li><li><strong>診断ログ：</strong> 端末内に7日分保存します。利用者が「診断情報を共有」を選んだときだけ、パスワードやトークンを伏せたうえで、利用者が選んだ方法で共有されます。自動では送信しません。</li></ul>
+<h2>4. 保存期間</h2>
+<div class="table"><table><thead><tr><th>情報</th><th>保存期間</th></tr></thead><tbody><tr><td>通話履歴</td><td>180日。それより古いものは自動で削除します</td></tr><tr><td>端末の登録情報・Push 通知のトークン</td><td>利用者がログアウトするか、Web 管理画面で iPhone を削除するまで</td></tr><tr><td>Web 管理画面の操作の記録</td><td>180日</td></tr><tr><td>Discord の情報・PBX の設定</td><td>利用者がアカウントの削除を申し出るまで</td></tr></tbody></table></div>
+<h2>5. 第三者への提供と、外部サービスの利用</h2>
+<p>運営者は、法令に基づく場合を除き、利用者の同意なく利用者の情報を第三者に提供しません。</p>
+<p>本サービスは、次の外部サービスを使います。運営者は、これらの事業者が、公表しているプライバシーポリシーに基づき、このポリシーと同等以上の保護を行っていることを確認したうえで利用します。</p>
+<div class="table"><table><thead><tr><th>事業者</th><th>所在国</th><th>送る情報</th><th>目的</th></tr></thead><tbody><tr><td>Apple Inc.（Apple Push Notification service）</td><td>米国</td><td>Push 通知のトークン、着信の識別子、発信者の番号と名前</td><td>着信を端末に知らせるため</td></tr><tr><td>Discord Inc.</td><td>米国</td><td>（運営者から送る個人情報はありません。ログイン時に、利用者の同意のもとで Discord から上記の情報を受け取ります）</td><td>Web 管理画面のログイン</td></tr></tbody></table></div>
+<p><strong>外国にある第三者への提供について</strong></p>
+<ul><li>移転先の国：アメリカ合衆国</li><li>移転先の国の個人情報の保護に関する制度：個人情報保護委員会が公表している「外国における個人情報の保護に関する制度等の調査」のとおりです。米国には、日本の個人情報保護法に相当する連邦法はなく、州法（カリフォルニア州消費者プライバシー法など）と分野ごとの法律で保護されています。</li><li>移転先の事業者が講じている措置：Apple Inc. は、同社のプライバシーポリシーに基づき、個人情報の保護のための措置を講じています（<a href="https://www.apple.com/jp/legal/privacy/">https://www.apple.com/jp/legal/privacy/</a>）。</li></ul>
+<h2>6. 安全管理措置</h2>
+<p>運営者は、利用者の情報を守るため、次の措置を講じています。</p>
+<ul><li><strong>組織的な措置：</strong> 運営者が責任者として、本サービスの情報の扱いを管理します。サーバーに触れられる者は、運営者と、運営者がサーバーの設置・保守を委託する協力者に限ります。</li><li><strong>人的な措置：</strong> 委託先の協力者に、このポリシーに沿った情報の扱いを守らせ、委託先として必要な監督を行います。</li><li><strong>物理的な措置：</strong> サーバーは日本国内の、委託先の協力者の住居に設置し、関係者以外が触れられないようにしています。</li><li><strong>技術的な措置：</strong> 本サービスは外部のインターネットに直接公開せず、VPN（Tailscale）のネットワーク内からだけ接続できるように運用します。SIP のパスワードは暗号化して保存し、アプリの認証に使う値は推測できないものを使い、サーバーにはそのハッシュだけを保存します。管理者が利用者の画面を開くのは、利用者が発行したサポート用パスコードを使った場合に限り、その操作は利用者の画面に記録されます。</li><li><strong>外的環境の把握：</strong> サーバーは日本国内に設置しています。外国にある第三者への提供は、5. のとおりです。</li></ul>
+<h2>7. 同意の取り消しと、情報の削除</h2>
+<ul><li><strong>本アプリの利用をやめる：</strong> アプリの「設定」→「ログアウト」で、端末の登録を解除できます。そのあとアプリを削除してください。</li><li><strong>iPhone の登録と通話履歴を削除する：</strong> Web 管理画面で iPhone を削除すると、その iPhone の登録と、サーバー上の通話履歴が削除されます。</li><li><strong>権限を取り消す：</strong> iPhone の連絡先・マイク・通知の利用は、iPhone の「設定」→「MyVoIP」でいつでもオフにできます。</li><li><strong>アカウントを削除する：</strong> 下記 8. の窓口にご連絡ください。Discord の情報・PBX の設定・残っている情報をすべて削除します。</li></ul>
+<h2>8. 開示・訂正・利用停止・削除などのご請求</h2>
+<p>保有している情報の利用目的の通知、開示、訂正・追加・削除、利用停止・消去、第三者への提供の停止のご請求は、次の方法で受け付けます。</p>
+<ul><li><strong>受付方法：</strong> 電子メールのみで受け付けます（<a href="mailto:tkytel-iosapp-support@nemnet-lab.net">tkytel-iosapp-support@nemnet-lab.net</a>）。件名に「個人情報に関する請求」と書き、請求の内容をお知らせください。</li><li><strong>本人確認：</strong> Web 管理画面にログインしている Discord アカウントからのご連絡、または Web 管理画面で発行したサポート用パスコードで、ご本人であることを確認します。</li><li><strong>手数料：</strong> かかりません。</li><li><strong>回答：</strong> 本人確認ができたあと、遅滞なく電子メールで回答します。</li></ul>
+<h2>9. 苦情・お問い合わせ</h2>
+<p>情報の扱いについての苦情やお問い合わせは、<a href="mailto:tkytel-iosapp-support@nemnet-lab.net">tkytel-iosapp-support@nemnet-lab.net</a> にご連絡ください。</p>
+<h2>10. 変更</h2>
+<p>このポリシーを変更するときは、変更後の内容をこのページに掲載し、重要な変更は本アプリまたは Web 管理画面でお知らせします。</p>
+<footer>MyVoIP</footer>
+</main>
+</body>
+</html>
