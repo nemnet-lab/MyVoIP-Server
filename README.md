@@ -99,6 +99,7 @@ docker compose logs -f myvoip   # "ARI events connected" が出れば MikoPBX �
 - `MYVOIP_ALLOWED_CLIENT_CIDRS` を設定すると、API に加えて、iPhone 用の SIP の受け口にも同じ制限がかかります。
 - 内線を登録（`extension set`）すると、中継用 Asterisk の設定が書き出され、すぐに MikoPBX への登録が始まります。手動で反映し直すときは `docker compose exec myvoip myvoip-server relay sync`。
 - 中継モードでは iPhone に MikoPBX のパスワードを渡しません。サーバーが iPhone 用のパスワードを別に発行します。
+- iPhone 用のエンドポイントは `rtp_timeout=60` です。アプリが通話中に強制終了されて BYE が届かなかった場合でも、iPhone からの音声が60秒途絶えたら通話を切り、PBX 側に通話を残しません（保留中は対象外）。
 
 ### リバースプロキシと HTTPS の選択
 
